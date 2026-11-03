@@ -46,6 +46,10 @@ pub struct Pacer {
 }
 
 const RTT_WINDOW_US: u64 = 10_000_000;
+/// Slack on top of the base round trip before the oldest frame in flight counts as stuck. A public
+/// tunnel's round trips spread over 50 ms or more without any queue (its p99 sits about that far
+/// above its best); a real queue is caught by the bitrate controller instead.
+const ALLOWANCE_US: u64 = 60_000;
 /// Queueing delay is judged from the best round trip over this window.
 const QUEUE_WINDOW_US: u64 = 500_000;
 const RATE_WINDOW_US: u64 = 1_000_000;
@@ -134,7 +138,7 @@ impl Pacer {
         };
         // A relay or Wi-Fi hop jitters by a good part of its round trip without any queue, so the
         // slack grows with the base round trip.
-        base + (2 * self.frame_interval_us).max(25_000).max(base)
+        base + (2 * self.frame_interval_us).max(ALLOWANCE_US).max(base)
     }
 
     /// The smallest round trip in the last `QUEUE_WINDOW_US`: jitter only adds to single
@@ -148,9 +152,9 @@ impl Pacer {
             .min()
     }
 
-    /// How many frames the path holds: one round trip plus some slack, in frames.
+    /// How many frames may be in flight: as many as are sent within the allowance, plus slack.
     fn window(&self) -> usize {
-        let frames = (self.min_rtt_us + 40_000) / self.frame_interval_us.max(1) + 2;
+        let frames = self.allowance_us() / self.frame_interval_us.max(1) + 2;
         frames.clamp(3, 40) as usize
     }
 
@@ -300,11 +304,12 @@ mod tests {
         p.on_ack(1, 4_000); // 4 ms round trip
         p.on_send(2, 50_000, 10_000);
         assert!(p.can_send(20_000));
-        // 4 ms + max(2 frames, 25 ms, rtt/2) = 37 ms allowance; at 60 ms the oldest frame is stuck.
-        assert!(!p.can_send(70_000));
+        // 4 ms + max(2 frames, 60 ms, rtt) = 64 ms allowance; at 70 ms the oldest frame is stuck.
+        assert!(p.can_send(70_000));
+        assert!(!p.can_send(80_000));
         assert_eq!(p.skipped, 1);
-        p.on_ack(2, 71_000);
-        assert!(p.can_send(71_000));
+        p.on_ack(2, 81_000);
+        assert!(p.can_send(81_000));
     }
 
     #[test]
@@ -390,15 +395,15 @@ mod tests {
     }
 
     #[test]
-    fn window_holds_one_round_trip_of_frames() {
+    fn window_holds_the_allowance_worth_of_frames() {
         let mut p = Pacer::new(10_000_000, 1_000_000, 50_000_000, 100);
         p.on_send(0, 1000, 0);
-        p.on_ack(0, 2_000); // 2 ms round trip: (2 + 40) / 10 + 2 = 6 frames
-        for id in 1..=6 {
+        p.on_ack(0, 2_000); // 2 ms round trip: (2 + 60) / 10 + 2 = 8 frames
+        for id in 1..=8 {
             assert!(p.can_send(id as u64 * 1_000), "frame {id}");
             p.on_send(id, 1000, id as u64 * 1_000);
         }
-        assert!(!p.can_send(7_000));
+        assert!(!p.can_send(9_000));
     }
 
     #[test]

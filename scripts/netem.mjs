@@ -4,10 +4,11 @@
 // its latency grow exactly as it would on the real thing.
 //
 //   node scripts/netem.mjs --listen 5591 --to 127.0.0.1:5491 --rtt 47 [--mbps 10] [--queue-ms 2000]
-//                          [--jitter 30]
+//                          [--jitter 30] [--spike 0.02:120]
 //
 // --jitter adds up to that many ms to each chunk's one-way delay, at random, in order (like a relay
-// that sometimes holds data back), without reordering anything.
+// that sometimes holds data back), without reordering anything. --spike p:ms holds a share p of
+// chunks back by up to that much more (a relay's occasional stall).
 import net from 'node:net';
 
 const arg = (name, def) => {
@@ -20,6 +21,7 @@ const oneWay = Number(arg('rtt', 47)) / 2;
 const mbps = Number(arg('mbps', 0));
 const queueMs = Number(arg('queue-ms', 2000));
 const jitter = Number(arg('jitter', 0));
+const [spikeP, spikeMs] = arg('spike', '0:0').split(':').map(Number);
 
 // One direction of the path: chunks leave the bottleneck one after another at `mbps`, then
 // arrive `oneWay` ms later. Reading from the source pauses while the queue is over `queueMs`.
@@ -42,7 +44,8 @@ function pipe(src, dst) {
       leaves = Math.max(now, linkFree) + (data.length * 8) / (mbps * 1000);
       linkFree = leaves;
     }
-    const at = Math.max(lastAt, leaves + oneWay + Math.random() * jitter);
+    const spike = Math.random() < spikeP ? Math.random() * spikeMs : 0;
+    const at = Math.max(lastAt, leaves + oneWay + Math.random() * jitter + spike);
     lastAt = at;
     q.push({ at, data });
     if (!timer) timer = setTimeout(flush, Math.max(0, q[0].at - now));

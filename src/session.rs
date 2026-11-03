@@ -11,7 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::capture::{self, Capture, Hub, InputSink, MonitorInfo};
 use crate::clock;
-use crate::encode::{self, Codec, EncoderParams, VideoEncoder};
+use crate::encode::{self, Codec, EncoderParams, RateChange, VideoEncoder};
 use crate::frame::{Signal, WAKE_COMMAND, WAKE_STOP};
 use crate::input;
 use crate::nvenc::FrameOpts;
@@ -747,6 +747,7 @@ fn encoder_loop(
     let mut announced = None;
     let mut input_answered = 0u64;
     let mut last_rate_change = Instant::now();
+    let mut reopen = false;
 
     loop {
         let flags = sh.sig.wait(timeout);
@@ -823,15 +824,23 @@ fn encoder_loop(
         let now_us = clock::now_us();
         {
             let mut p = sh.pacer.lock().unwrap();
-            if let Some(b) = p.adjust(now_us)
-                && let Some(e) = &mut enc
+            p.adjust(now_us);
+            let b = p.target_bps;
+            if let Some(e) = &mut enc
+                && b != e.bitrate()
             {
-                // Where a change costs a keyframe (FFmpeg's NVENC wrapper), only follow big moves,
-                // at most every 3 s. Elsewhere follow every move of more than a few percent.
+                // Encoders that reconfigure in place follow every move of more than a few
+                // percent. Where a change costs a keyframe (FFmpeg's NVENC wrapper, or a new
+                // encoder for VA-API and the other FFmpeg ones), only big moves, at most every 3 s.
                 let ratio = b.max(e.bitrate()) as f64 / b.min(e.bitrate()).max(1) as f64;
                 let rarely = last_rate_change.elapsed() >= Duration::from_secs(3) && ratio >= 1.5;
-                if (!e.bitrate_change_is_keyframe() && ratio > 1.04) || rarely {
-                    e.set_bitrate(b);
+                match e.caps().rate {
+                    RateChange::InPlace if ratio > 1.04 => e.set_bitrate(b),
+                    RateChange::Keyframe if rarely => e.set_bitrate(b),
+                    RateChange::Reopen if rarely => reopen = true,
+                    _ => {}
+                }
+                if ratio > 1.04 && (e.caps().rate == RateChange::InPlace || rarely) {
                     last_rate_change = Instant::now();
                 }
             }
@@ -840,6 +849,11 @@ fn encoder_loop(
                 // missed is gone, so start over from a keyframe.
                 need_key = true;
             }
+        }
+        if reopen {
+            // Opened again below at the new target, starting with a keyframe.
+            reopen = false;
+            enc = None;
         }
         if stats.since.elapsed() >= Duration::from_secs(1) {
             let frames_in = store.lock().frames_in;

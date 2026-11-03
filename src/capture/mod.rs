@@ -153,6 +153,14 @@ pub fn open_backend(kind: &str, synthetic_fps: u32) -> Result<Arc<dyn Backend>> 
             }
             if std::env::var_os("DISPLAY").is_some() {
                 match x11::X11Backend::connect() {
+                    // Under GNOME or wlroots the X display is Xwayland, which only holds X
+                    // windows: streaming it would show a black desktop. Say so instead.
+                    Ok(b) if b.xwayland => errors.push(
+                        "x11: DISPLAY is Xwayland inside a Wayland session, which is not the \
+                         desktop; this Wayland desktop needs the portal backend (not supported \
+                         yet), or log in to an X11 session"
+                            .into(),
+                    ),
                     Ok(b) => return Ok(Arc::new(b)),
                     Err(e) => errors.push(format!("x11: {e:#}")),
                 }

@@ -30,6 +30,8 @@ pub struct X11Backend {
     conn: Arc<RustConnection>,
     root: xproto::Window,
     input: Arc<X11Input>,
+    /// The X server is Xwayland inside a Wayland session: its root window is not the desktop.
+    pub xwayland: bool,
 }
 
 impl X11Backend {
@@ -46,13 +48,19 @@ impl X11Backend {
                 bail!("the X server lacks the {what} extension");
             }
         }
+        let xwayland = conn.extension_information("XWAYLAND")?.is_some();
         let conn = Arc::new(conn);
         let input = Arc::new(X11Input {
             conn: conn.clone(),
             root,
             scroll: Mutex::new((0.0, 0.0)),
         });
-        Ok(X11Backend { conn, root, input })
+        Ok(X11Backend {
+            conn,
+            root,
+            input,
+            xwayland,
+        })
     }
 }
 
@@ -193,6 +201,14 @@ impl Drop for StopOnDrop {
     }
 }
 
+/// Where grabbed pixels land.
+enum Grab {
+    /// A segment the X server writes into directly.
+    Shm { seg: ShmSeg, shmseg: u32 },
+    /// A buffer filled from GetImage replies.
+    Plain(Vec<u8>),
+}
+
 /// A System V shared memory segment attached both here and in the X server.
 struct ShmSeg {
     addr: *mut u8,
@@ -253,10 +269,31 @@ fn capture_loop(
     conn.xfixes_query_version(5, 0)?.reply()?;
     let (w, h) = (mon.width, mon.height);
     let stride = w as usize * 4;
-    let (seg, shmid) = ShmSeg::new(stride * h as usize)?;
-    let shmseg = conn.generate_id()?;
-    conn.shm_attach(shmseg, shmid as u32, false)?.check()?;
-    unsafe { libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut()) };
+    // Shared memory when the X server can attach our segment; plain GetImage over the socket
+    // when it cannot (another user or IPC namespace, a remote server), which is slower but works.
+    let mut grab = match ShmSeg::new(stride * h as usize) {
+        Ok((seg, shmid)) => {
+            let shmseg = conn.generate_id()?;
+            let ok = conn
+                .shm_attach(shmseg, shmid as u32, false)
+                .ok()
+                .and_then(|c| c.check().ok())
+                .is_some();
+            unsafe { libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut()) };
+            if ok {
+                Grab::Shm { seg, shmseg }
+            } else {
+                tracing::warn!(
+                    "the X server cannot attach shared memory; capturing through GetImage"
+                );
+                Grab::Plain(vec![0; stride * h as usize])
+            }
+        }
+        Err(e) => {
+            tracing::warn!("no shared memory ({e:#}); capturing through GetImage");
+            Grab::Plain(vec![0; stride * h as usize])
+        }
+    };
 
     // One event when the screen goes from unchanged to changed; the region is fetched (and
     // reset) at grab time. Per-rectangle events would cost the X server an event for every
@@ -363,23 +400,46 @@ fn capture_loop(
                     Rect::new(0, b.y, w, b.h)
                 };
                 let t = clock::now_us();
-                conn.shm_get_image(
-                    root,
-                    mon.x as i16,
-                    (mon.y + band.y as i32) as i16,
-                    w as u16,
-                    band.h as u16,
-                    !0,
-                    xproto::ImageFormat::Z_PIXMAP.into(),
-                    shmseg,
-                    (band.y as usize * stride) as u32,
-                )?
-                .reply()?;
+                let (x, y) = (mon.x as i16, (mon.y + band.y as i32) as i16);
+                let offset = band.y as usize * stride;
+                let pixels: &[u8] = match &mut grab {
+                    Grab::Shm { seg, shmseg } => {
+                        conn.shm_get_image(
+                            root,
+                            x,
+                            y,
+                            w as u16,
+                            band.h as u16,
+                            !0,
+                            xproto::ImageFormat::Z_PIXMAP.into(),
+                            *shmseg,
+                            offset as u32,
+                        )?
+                        .reply()?;
+                        seg.bytes()
+                    }
+                    Grab::Plain(buf) => {
+                        let img = conn
+                            .get_image(
+                                xproto::ImageFormat::Z_PIXMAP,
+                                root,
+                                x,
+                                y,
+                                w as u16,
+                                band.h as u16,
+                                !0,
+                            )?
+                            .reply()?;
+                        let n = img.data.len().min(buf.len() - offset);
+                        buf[offset..offset + n].copy_from_slice(&img.data[..n]);
+                        buf
+                    }
+                };
                 store.update(
                     w,
                     h,
                     PixelFormat::Bgrx,
-                    seg.bytes(),
+                    pixels,
                     stride,
                     if first { None } else { Some(&damage) },
                     t,
@@ -494,7 +554,9 @@ fn capture_loop(
         }
     }
     store.clear_requester();
-    let _ = conn.shm_detach(shmseg);
+    if let Grab::Shm { shmseg, .. } = &grab {
+        let _ = conn.shm_detach(*shmseg);
+    }
     let _ = conn.flush();
     Ok(())
 }

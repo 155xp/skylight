@@ -1,0 +1,14 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  build-and-test:
+    # No GPU here: this proves Skylight builds and streams with no vendor libraries installed.
+    runs-on: ubuntu-latest
+    container: rust:1-trixie
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libpipewire-0.3-dev libspa-0.2-dev \
+            libavcodec-dev libavutil-dev libswscale-dev clang pkg-config
+      - run: scripts/ci.sh

@@ -203,14 +203,14 @@ pub fn run(
 }
 
 /// Software decoder used only to measure what the browser would see.
-struct Decoder {
+pub(crate) struct Decoder {
     ctx: *mut ff::AVCodecContext,
     frame: *mut ff::AVFrame,
     pkt: *mut ff::AVPacket,
 }
 
 impl Decoder {
-    fn new(codec: Codec, _w: u32, _h: u32) -> Result<Decoder> {
+    pub(crate) fn new(codec: Codec, _w: u32, _h: u32) -> Result<Decoder> {
         let id = match codec {
             Codec::H264 => ff::AVCodecID::AV_CODEC_ID_H264,
             Codec::Hevc => ff::AVCodecID::AV_CODEC_ID_HEVC,
@@ -234,7 +234,7 @@ impl Decoder {
     }
 
     /// Decode one access unit and return luma PSNR against the BGRx/RGBx source.
-    fn decode_psnr(&mut self, data: &[u8], src: &[u8], bgr: bool) -> Result<f64> {
+    pub(crate) fn decode_psnr(&mut self, data: &[u8], src: &[u8], bgr: bool) -> Result<f64> {
         unsafe {
             ff::av_new_packet(self.pkt, data.len() as i32);
             ptr::copy_nonoverlapping(data.as_ptr(), (*self.pkt).data, data.len());

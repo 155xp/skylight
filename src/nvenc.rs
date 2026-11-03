@@ -226,9 +226,15 @@ fn dlopen(name: &str) -> Result<*mut c_void> {
     Ok(lib)
 }
 
+/// The driver's libraries are opened at runtime, never linked: a machine without NVIDIA's driver
+/// gets an error here and the encoder list moves on to VA-API or software.
 fn load() -> Result<Api> {
-    let cuda = dlopen("libcuda.so.1")?;
-    let nvenc = dlopen("libnvidia-encode.so.1")?;
+    load_from("libcuda.so.1", "libnvidia-encode.so.1")
+}
+
+fn load_from(cuda_lib: &str, nvenc_lib: &str) -> Result<Api> {
+    let cuda = dlopen(cuda_lib)?;
+    let nvenc = dlopen(nvenc_lib)?;
     let cu_init: unsafe extern "C" fn(u32) -> i32 = dlsym(cuda, "cuInit")?;
     if unsafe { cu_init(0) } != 0 {
         bail!("cuInit failed");
@@ -625,5 +631,21 @@ impl Drop for NvEncoder {
                 (self.api.cu_ctx_destroy)(self.cuda);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_driver_is_an_error_not_a_crash() {
+        let e = load_from(
+            "libcuda-not-installed.so.1",
+            "libnvidia-encode-not-installed.so.1",
+        )
+        .err()
+        .expect("loading a library that does not exist must fail");
+        assert!(format!("{e:#}").contains("not found"), "{e:#}");
     }
 }

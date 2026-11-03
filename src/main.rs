@@ -75,7 +75,8 @@ enum Cmd {
         allow_origins: Vec<String>,
         #[arg(long, default_value = "auto", env = "SKYLIGHT_BACKEND")]
         backend: String,
-        #[arg(long, value_enum, default_value = "auto")]
+        /// Which encoder family to use; `auto` tries NVENC, then VA-API, then software.
+        #[arg(long, value_enum, default_value = "auto", env = "SKYLIGHT_ENCODER")]
         encoder: EncoderArg,
         /// Frame-rate cap; clients may ask for less.
         #[arg(long, default_value_t = 144)]
@@ -147,7 +148,8 @@ enum Cmd {
         backend: String,
         #[arg(long, default_value_t = 5)]
         seconds: u64,
-        #[arg(long, value_enum, default_value = "auto")]
+        /// Which encoder family to use; `auto` tries NVENC, then VA-API, then software.
+        #[arg(long, value_enum, default_value = "auto", env = "SKYLIGHT_ENCODER")]
         encoder: EncoderArg,
         #[arg(long, default_value = "h264")]
         codec: String,

@@ -91,16 +91,63 @@ impl Default for EncoderParams {
     }
 }
 
+/// How an encoder takes a new bitrate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RateChange {
+    /// Reconfigured between two frames; the stream just continues (NVENC direct, x264).
+    InPlace,
+    /// Applied, but the encoder resets and sends a keyframe (FFmpeg's NVENC wrapper).
+    Keyframe,
+    /// Only by opening a new encoder, which starts with a keyframe (VA-API, x265, SVT-AV1,
+    /// OpenH264: their FFmpeg wrappers read the rate once).
+    Reopen,
+}
+
+/// What an encoder can do beyond plain frames, so the session uses each speed trick only where
+/// the API allows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caps {
+    pub rate: RateChange,
+    /// Lower the QP of a frame on request (refinement): NVENC's QP map, or FFmpeg's
+    /// region-of-interest offsets on x264, x265 and VA-API (where the driver supports ROI).
+    pub sharpen: bool,
+    /// Give every forced keyframe a bigger budget for that one frame, without a reset (NVENC
+    /// direct). x264 applies a new budget only from the next frame, so it gets the boost for its
+    /// first keyframe only, by opening with it; the others have to start at their normal budget.
+    pub keyframe_boost: bool,
+}
+
+impl Caps {
+    /// The capabilities of an encoder, by name ("nvenc" is the direct NVENC path).
+    pub fn of(name: &str, nvenc_dynamic_bitrate: bool) -> Caps {
+        let (rate, sharpen, keyframe_boost) = match name {
+            "nvenc" if nvenc_dynamic_bitrate => (RateChange::InPlace, true, true),
+            "nvenc" => (RateChange::Keyframe, true, false),
+            "libx264" => (RateChange::InPlace, true, false),
+            "libx265" => (RateChange::Reopen, true, false),
+            n if n.ends_with("_nvenc") => (RateChange::Keyframe, false, false),
+            n if n.ends_with("_vaapi") => (RateChange::Reopen, true, false),
+            _ => (RateChange::Reopen, false, false),
+        };
+        Caps {
+            rate,
+            sharpen,
+            keyframe_boost,
+        }
+    }
+}
+
 pub struct VideoEncoder {
     /// Set when NVENC is driven directly; the FFmpeg fields below are then unused.
     nv: Option<NvEncoder>,
-    nv_dynamic: bool,
+    caps: Caps,
+    /// The encoder was opened with a keyframe-sized budget, to drop after the first frame.
+    first_boosted: bool,
     ctx: *mut ff::AVCodecContext,
     /// Packed RGB input the caller writes into.
     src: *mut ff::AVFrame,
     /// Converted frame for encoders that need YUV in system memory (x264) or a GPU upload (VAAPI).
     conv: *mut ff::AVFrame,
-    hw: *mut ff::AVFrame,
     sws: *mut ff::SwsContext,
     hw_device: *mut ff::AVBufferRef,
     pkt: *mut ff::AVPacket,
@@ -161,9 +208,11 @@ pub fn init_logging(verbose: bool) {
     }
 }
 
-/// Names of the encoders to try for a codec and backend, best first. `nvenc` is the direct
-/// driver path; set SKYLIGHT_NVENC_DIRECT=0 to use FFmpeg's wrapper instead.
-fn candidates(codec: Codec, backend: Backend) -> Vec<&'static str> {
+/// Names of the encoders to try for a codec and backend, best first: NVENC (driven directly,
+/// then through FFmpeg), VA-API (Intel, AMD), then software. `nvenc` is the direct path; set
+/// SKYLIGHT_NVENC_DIRECT=0 to use FFmpeg's wrapper instead. Each is tried at runtime, so a
+/// machine without a GPU (or without NVIDIA's driver) simply ends up on software.
+pub fn candidates(codec: Codec, backend: Backend) -> Vec<&'static str> {
     let direct = std::env::var("SKYLIGHT_NVENC_DIRECT").map_or(true, |v| v != "0");
     let nv_direct: &[&'static str] = if direct { &["nvenc"] } else { &[] };
     let nv = match codec {
@@ -189,6 +238,23 @@ fn candidates(codec: Codec, backend: Backend) -> Vec<&'static str> {
     }
 }
 
+/// VA-API render nodes to try: SKYLIGHT_VAAPI_DEVICE if set, else every /dev/dri/renderD*.
+fn vaapi_nodes() -> Vec<String> {
+    if let Ok(d) = std::env::var("SKYLIGHT_VAAPI_DEVICE") {
+        return vec![d];
+    }
+    let mut v: Vec<String> = std::fs::read_dir("/dev/dri")
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .map(|e| e.path().to_string_lossy().into_owned())
+                .filter(|p| p.contains("renderD"))
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
 impl VideoEncoder {
     /// Open the best available encoder for `p`, falling back down the list.
     pub fn open(p: &EncoderParams) -> Result<VideoEncoder> {
@@ -206,16 +272,42 @@ impl VideoEncoder {
         if p.width < 16 || p.height < 16 || p.width > 8192 || p.height > 8192 {
             bail!("unsupported size {}x{}", p.width, p.height);
         }
+        if name.ends_with("_vaapi") {
+            // Machines with two GPUs (an NVIDIA card next to an Intel iGPU, say) have several
+            // render nodes, and only some of their VA-API drivers encode: try each. Ask for
+            // capped VBR first, then whatever rate control the driver offers.
+            let mut errors = Vec::new();
+            for node in vaapi_nodes() {
+                for rc in ["VBR", "CBR"] {
+                    match Self::open_ffmpeg(name, p, Some((&node, rc))) {
+                        Ok(e) => return Ok(e),
+                        Err(e) => errors.push(format!("{node} {rc}: {e:#}")),
+                    }
+                }
+            }
+            if errors.is_empty() {
+                bail!("no /dev/dri render node");
+            }
+            bail!("{}", errors.join("; "));
+        }
+        Self::open_ffmpeg(name, p, None)
+    }
+
+    fn open_ffmpeg(
+        name: &str,
+        p: &EncoderParams,
+        vaapi: Option<(&str, &str)>,
+    ) -> Result<VideoEncoder> {
         if name == "nvenc" {
             let nv = NvEncoder::open(p)?;
-            let nv_dynamic = nv.dynamic_bitrate();
+            let caps = Caps::of("nvenc", nv.dynamic_bitrate());
             return Ok(VideoEncoder {
                 nv: Some(nv),
-                nv_dynamic,
+                caps,
+                first_boosted: false,
                 ctx: ptr::null_mut(),
                 src: ptr::null_mut(),
                 conv: ptr::null_mut(),
-                hw: ptr::null_mut(),
                 sws: ptr::null_mut(),
                 hw_device: ptr::null_mut(),
                 pkt: ptr::null_mut(),
@@ -241,15 +333,16 @@ impl VideoEncoder {
             bail!("not built into this ffmpeg");
         }
         let nvenc = name.ends_with("_nvenc");
-        let vaapi = name.ends_with("_vaapi");
+        let vaapi_opts = vaapi;
+        let vaapi = vaapi.is_some();
         let hardware = nvenc || vaapi;
         let mut enc = VideoEncoder {
             nv: None,
-            nv_dynamic: false,
+            caps: Caps::of(name, false),
+            first_boosted: false,
             ctx: ptr::null_mut(),
             src: ptr::null_mut(),
             conv: ptr::null_mut(),
-            hw: ptr::null_mut(),
             sws: ptr::null_mut(),
             hw_device: ptr::null_mut(),
             pkt: ptr::null_mut(),
@@ -287,6 +380,15 @@ impl VideoEncoder {
             (*ctx).max_b_frames = 0;
             (*ctx).flags |= ff::AV_CODEC_FLAG_LOW_DELAY as i32;
             enc.apply_rate(p.bitrate);
+            if name == "libx264" {
+                // A viewer's first frame is a keyframe that repaints everything: open with four
+                // times the usual budget so it comes out sharp, and drop to normal after it.
+                (*ctx).bit_rate = (p.bitrate * 4) as i64;
+                (*ctx).rc_max_rate = (p.bitrate * 4) as i64;
+                (*ctx).rc_buffer_size =
+                    (p.bitrate * 4 * enc.vbv_ms as u64 / 1000).min(i32::MAX as u64) as i32;
+                enc.first_boosted = true;
+            }
 
             let src_fmt = src_pix_fmt(p.format);
             if nvenc {
@@ -310,12 +412,9 @@ impl VideoEncoder {
                 } else if p.codec == Codec::Hevc {
                     set_opt(ctx, "profile", "main");
                 }
-            } else if vaapi {
+            } else if let Some((node, rc_mode)) = vaapi_opts {
                 let mut dev: *mut ff::AVBufferRef = ptr::null_mut();
-                let node = CString::new(
-                    std::env::var("SKYLIGHT_VAAPI_DEVICE").unwrap_or("/dev/dri/renderD128".into()),
-                )
-                .unwrap();
+                let node = CString::new(node).unwrap();
                 let r = ff::av_hwdevice_ctx_create(
                     &mut dev,
                     ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
@@ -342,7 +441,8 @@ impl VideoEncoder {
                 }
                 (*ctx).hw_frames_ctx = frames;
                 (*ctx).pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
-                set_opt(ctx, "rc_mode", "CBR");
+                set_opt(ctx, "rc_mode", rc_mode);
+                // One frame in the pipeline: each frame is out before the next goes in.
                 set_opt(ctx, "async_depth", "1");
                 if p.codec == Codec::H264 {
                     set_opt(ctx, "profile", "high");
@@ -417,13 +517,6 @@ impl VideoEncoder {
                 }
                 let threads = CString::new("threads").unwrap();
                 ff::av_opt_set_int(enc.sws as *mut _, threads.as_ptr(), 0, 0);
-                if vaapi {
-                    enc.hw = ff::av_frame_alloc();
-                    let r = ff::av_hwframe_get_buffer((*ctx).hw_frames_ctx, enc.hw, 0);
-                    if r < 0 {
-                        bail!("VAAPI surface: {}", averr(r));
-                    }
-                }
             }
             enc.pkt = ff::av_packet_alloc();
         }
@@ -441,9 +534,9 @@ impl VideoEncoder {
         self.bitrate = bitrate;
     }
 
-    /// Change the bitrate cap between frames. x264 reconfigures in place. FFmpeg's NVENC wrapper
-    /// resets the encoder and sends a keyframe on every change (see `bitrate_change_is_keyframe`),
-    /// so callers should change it rarely there.
+    /// Change the bitrate cap between frames. What that costs depends on `caps().rate`: nothing
+    /// (NVENC direct, x264), a keyframe (FFmpeg's NVENC), or nothing at all happens and the
+    /// caller has to open a new encoder (`Reopen`).
     pub fn set_bitrate(&mut self, bitrate: u64) {
         let bitrate = bitrate.clamp(250_000, 400_000_000);
         if let Some(nv) = &mut self.nv {
@@ -458,11 +551,8 @@ impl VideoEncoder {
         }
     }
 
-    pub fn bitrate_change_is_keyframe(&self) -> bool {
-        match &self.nv {
-            Some(_) => !self.nv_dynamic,
-            None => self.name.ends_with("_nvenc"),
-        }
+    pub fn caps(&self) -> Caps {
+        self.caps
     }
 
     pub fn bitrate(&self) -> u64 {
@@ -505,6 +595,25 @@ impl VideoEncoder {
         }
         let keyframe = opts.keyframe;
         unsafe {
+            let r = self.encode_ffmpeg(keyframe, opts.sharpen, out);
+            if self.first_boosted {
+                // The first keyframe went out with the bigger budget; back to normal (x264
+                // applies this from the next frame on).
+                self.first_boosted = false;
+                self.apply_rate(self.bitrate);
+            }
+            r
+        }
+    }
+
+    unsafe fn encode_ffmpeg(
+        &mut self,
+        keyframe: bool,
+        sharpen: u8,
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        unsafe {
+            let mut hw_frame: *mut ff::AVFrame = ptr::null_mut();
             let frame = if self.conv.is_null() {
                 self.src
             } else {
@@ -518,16 +627,50 @@ impl VideoEncoder {
                     (*self.conv).data.as_ptr(),
                     (*self.conv).linesize.as_ptr(),
                 );
-                if self.hw.is_null() {
+                if self.hw_device.is_null() {
                     self.conv
                 } else {
-                    let r = ff::av_hwframe_transfer_data(self.hw, self.conv, 0);
+                    // A fresh surface from the pool per frame: the encoder may still hold the
+                    // previous one.
+                    hw_frame = ff::av_frame_alloc();
+                    let mut r = ff::av_hwframe_get_buffer((*self.ctx).hw_frames_ctx, hw_frame, 0);
+                    if r >= 0 {
+                        r = ff::av_hwframe_transfer_data(hw_frame, self.conv, 0);
+                    }
                     if r < 0 {
+                        ff::av_frame_free(&mut hw_frame);
                         bail!("upload: {}", averr(r));
                     }
-                    self.hw
+                    hw_frame
                 }
             };
+            ff::av_frame_remove_side_data(
+                frame,
+                ff::AVFrameSideDataType::AV_FRAME_DATA_REGIONS_OF_INTEREST,
+            );
+            if sharpen > 0 && self.caps.sharpen {
+                // The whole frame as one region with a negative QP offset (as a fraction of the
+                // QP range, which FFmpeg's wrappers map onto each encoder's scale).
+                let sd = ff::av_frame_new_side_data(
+                    frame,
+                    ff::AVFrameSideDataType::AV_FRAME_DATA_REGIONS_OF_INTEREST,
+                    std::mem::size_of::<ff::AVRegionOfInterest>(),
+                );
+                if !sd.is_null() {
+                    let roi = (*sd).data as *mut ff::AVRegionOfInterest;
+                    *roi = ff::AVRegionOfInterest {
+                        self_size: std::mem::size_of::<ff::AVRegionOfInterest>() as u32,
+                        top: 0,
+                        bottom: (*frame).height,
+                        left: 0,
+                        right: (*frame).width,
+                        qoffset: ff::AVRational {
+                            num: -(sharpen.min(51) as i32),
+                            den: 51,
+                        },
+                    };
+                }
+            }
             (*frame).pts = self.pts;
             self.pts += 1;
             (*frame).pict_type = if keyframe {
@@ -541,6 +684,9 @@ impl VideoEncoder {
                 (*frame).flags &= !ff::AV_FRAME_FLAG_KEY;
             }
             let r = ff::avcodec_send_frame(self.ctx, frame);
+            if !hw_frame.is_null() {
+                ff::av_frame_free(&mut hw_frame);
+            }
             if r < 0 {
                 bail!("send_frame: {}", averr(r));
             }
@@ -589,7 +735,7 @@ impl Drop for VideoEncoder {
             if !self.ctx.is_null() {
                 ff::avcodec_free_context(&mut self.ctx);
             }
-            for f in [&mut self.src, &mut self.conv, &mut self.hw] {
+            for f in [&mut self.src, &mut self.conv] {
                 if !f.is_null() {
                     ff::av_frame_free(f);
                 }
@@ -673,6 +819,190 @@ mod tests {
         assert!(enc.encode(true, &mut out).unwrap(), "keyframe on request");
     }
 
+    /// Pseudo-random noise: hard to compress, so rate control and quantization show.
+    fn noise(enc: &mut VideoEncoder, seed: u32) -> Vec<u8> {
+        let (w, h) = (enc.width as usize, enc.height as usize);
+        let (buf, stride) = enc.input().unwrap();
+        let mut img = vec![0u8; w * h * 4];
+        let mut x = seed.wrapping_mul(2654435761) | 1;
+        for y in 0..h {
+            for c in 0..w {
+                // Smooth gradients plus a little noise, like a photo or a game frame.
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                let n = (x & 31) as u8;
+                let px = [
+                    ((c * 255 / w) as u8).wrapping_add(n),
+                    ((y * 255 / h) as u8).wrapping_add(n),
+                    (((c + y + seed as usize) * 3) as u8).wrapping_add(n),
+                    255,
+                ];
+                img[(y * w + c) * 4..(y * w + c) * 4 + 4].copy_from_slice(&px);
+                buf[y * stride + c * 4..y * stride + c * 4 + 4].copy_from_slice(&px);
+            }
+        }
+        img
+    }
+
+    fn software(w: u32, h: u32, bitrate: u64, cq: Option<u8>) -> VideoEncoder {
+        let p = EncoderParams {
+            width: w,
+            height: h,
+            bitrate,
+            cq,
+            vbv_ms: 34,
+            backend: Backend::Software,
+            ..Default::default()
+        };
+        VideoEncoder::open_named("libx264", &p).expect("libx264 should be available")
+    }
+
+    #[test]
+    fn encoders_are_tried_hardware_first_then_software() {
+        assert_eq!(
+            candidates(Codec::H264, Backend::Auto),
+            [
+                "nvenc",
+                "h264_nvenc",
+                "h264_vaapi",
+                "libx264",
+                "libopenh264"
+            ]
+        );
+        assert_eq!(
+            candidates(Codec::H264, Backend::Software),
+            ["libx264", "libopenh264"]
+        );
+        assert_eq!(candidates(Codec::H264, Backend::Vaapi), ["h264_vaapi"]);
+        assert_eq!(
+            candidates(Codec::Hevc, Backend::Nvenc),
+            ["nvenc", "hevc_nvenc"]
+        );
+    }
+
+    #[test]
+    fn each_encoder_says_what_it_can_do() {
+        assert_eq!(Caps::of("nvenc", true).rate, RateChange::InPlace);
+        assert!(Caps::of("nvenc", true).keyframe_boost);
+        assert_eq!(Caps::of("h264_nvenc", false).rate, RateChange::Keyframe);
+        assert!(!Caps::of("h264_nvenc", false).sharpen);
+        let va = Caps::of("h264_vaapi", false);
+        assert_eq!(
+            (va.rate, va.sharpen, va.keyframe_boost),
+            (RateChange::Reopen, true, false)
+        );
+        let x264 = Caps::of("libx264", false);
+        assert_eq!(
+            (x264.rate, x264.sharpen, x264.keyframe_boost),
+            (RateChange::InPlace, true, false)
+        );
+        assert_eq!(Caps::of("libopenh264", false).rate, RateChange::Reopen);
+    }
+
+    #[test]
+    fn auto_always_finds_an_encoder() {
+        // On a machine without any GPU this is x264; it must never come up empty.
+        let p = EncoderParams {
+            width: 320,
+            height: 240,
+            ..Default::default()
+        };
+        let mut enc = VideoEncoder::open(&p).unwrap();
+        gradient(&mut enc, 0);
+        let mut out = Vec::new();
+        assert!(enc.encode(true, &mut out).unwrap());
+    }
+
+    #[test]
+    fn x264_changes_bitrate_without_a_keyframe() {
+        let mut enc = software(320, 240, 2_000_000, Some(23));
+        assert_eq!(enc.caps().rate, RateChange::InPlace);
+        let mut out = Vec::new();
+        noise(&mut enc, 1);
+        assert!(enc.encode(true, &mut out).unwrap());
+        let mut sizes = Vec::new();
+        for (i, rate) in [6_000_000, 500_000].into_iter().enumerate() {
+            enc.set_bitrate(rate);
+            let mut total = 0;
+            for f in 0..10 {
+                noise(&mut enc, 2 + (i * 10 + f) as u32);
+                out.clear();
+                assert!(
+                    !enc.encode(false, &mut out).unwrap(),
+                    "change {i} made a keyframe"
+                );
+                total += out.len();
+            }
+            sizes.push(total);
+        }
+        // The lower rate really takes effect.
+        assert!(sizes[1] * 3 < sizes[0], "{sizes:?}");
+    }
+
+    #[test]
+    fn x264_first_keyframe_gets_a_bigger_budget_then_normal_frames() {
+        // 1 Mbit/s with a 34 ms VBV, in bitrate mode: a normal frame may be about 4 kB.
+        let mut enc = software(640, 360, 1_000_000, None);
+        let normal_vbv = 1_000_000 / 8 * 34 / 1000;
+        let mut out = Vec::new();
+        noise(&mut enc, 1);
+        assert!(enc.encode(true, &mut out).unwrap());
+        assert!(
+            out.len() > normal_vbv * 2,
+            "keyframe {} B, normal cap {normal_vbv} B",
+            out.len()
+        );
+        // A couple of frames later everything is held to the normal cap again (with some slack for
+        // x264's VBV model).
+        let mut sizes = Vec::new();
+        for i in 0..6 {
+            noise(&mut enc, 10 + i);
+            out.clear();
+            assert!(!enc.encode(false, &mut out).unwrap());
+            sizes.push(out.len());
+        }
+        assert!(sizes[2..].iter().all(|&b| b < normal_vbv * 2), "{sizes:?}");
+    }
+
+    #[test]
+    fn sharpening_refines_a_still_image_on_x264() {
+        // The case refinement is for: a big change squeezed under a low cap, then the same image
+        // re-encoded. With a QP offset the refinement must get measurably closer to the source.
+        let run = |sharpen: u8| {
+            // 8 Mbit/s: room under the cap for the refinement to spend more bits.
+            let mut enc = software(640, 360, 8_000_000, Some(23));
+            let mut dec = crate::bench::Decoder::new(Codec::H264, 640, 360).unwrap();
+            let mut out = Vec::new();
+            enc.input().unwrap().0.fill(0);
+            enc.encode(true, &mut out).unwrap();
+            let img = noise(&mut enc, 7);
+            dec.decode_psnr(&out, &img, true).unwrap();
+            out.clear();
+            enc.encode(false, &mut out).unwrap();
+            dec.decode_psnr(&out, &img, true).unwrap();
+            let mut psnr = 0.0;
+            for _ in 0..3 {
+                out.clear();
+                enc.encode_with(
+                    FrameOpts {
+                        keyframe: false,
+                        sharpen,
+                    },
+                    &mut out,
+                )
+                .unwrap();
+                psnr = dec.decode_psnr(&out, &img, true).unwrap();
+            }
+            psnr
+        };
+        let (plain, sharp) = (run(0), run(8));
+        assert!(
+            sharp > plain + 0.5,
+            "sharpened {sharp:.2} dB vs plain {plain:.2} dB"
+        );
+    }
+
     #[test]
     fn odd_sizes_are_padded() {
         let p = EncoderParams {
@@ -704,7 +1034,7 @@ mod nvenc {
             ..Default::default()
         };
         let mut enc = VideoEncoder::open_named("h264_nvenc", &p).unwrap();
-        assert!(enc.bitrate_change_is_keyframe());
+        assert_eq!(enc.caps().rate, RateChange::Keyframe);
         let mut out = Vec::new();
         let mut keys = Vec::new();
         for i in 0..6u32 {
@@ -733,7 +1063,7 @@ mod nvenc {
             ..Default::default()
         };
         let mut enc = VideoEncoder::open_named("nvenc", &p).unwrap();
-        assert!(!enc.bitrate_change_is_keyframe());
+        assert_eq!(enc.caps().rate, RateChange::InPlace);
         let mut out = Vec::new();
         let (buf, _) = enc.input().unwrap();
         buf.iter_mut()

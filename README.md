@@ -36,9 +36,13 @@ arrives. The cursor is drawn by the browser, so it never lags.
 - Linux with **KDE Plasma 6 on Wayland**, or any **X11** session. GNOME and wlroots Wayland
   sessions are not supported yet (they need the xdg-desktop-portal path).
 - PipeWire and FFmpeg's libraries (libavcodec, libavutil, libswscale).
-- For hardware encoding: an NVIDIA GPU with NVENC, or (untested) a VAAPI-capable Intel or AMD GPU.
-  Without one, x264 keeps up on a modern CPU.
-- To build: Rust 1.88 or newer, clang and pkg-config.
+- A GPU is optional. With an NVIDIA GPU and its driver, Skylight uses NVENC; with an Intel or AMD
+  GPU, VA-API; with neither, x264 (or OpenH264), which keeps up on a modern CPU. The choice is made
+  at runtime, so one binary runs everywhere (see [Encoders](#encoders)).
+- To build: Rust 1.88 or newer, clang and pkg-config. No GPU vendor SDK or headers: NVIDIA's
+  libraries are loaded at runtime when present, never linked.
+- Linux only: capture and input go through KWin, X11 and PipeWire. There are no macOS or Windows
+  builds.
 - A browser with WebCodecs on an HTTPS page (or localhost): current Chrome, Edge, Safari and
   Firefox.
 
@@ -110,7 +114,9 @@ or from the matching flags (`skylight serve --help`):
 | `SKYLIGHT_LISTEN` / `--listen` | `127.0.0.1:5490` | loopback address to listen on; anything else is refused |
 | `SKYLIGHT_BACKEND` / `--backend` | `auto` | `kde`, `x11` or `synthetic`; `auto` picks KWin, then X11 |
 | `SKYLIGHT_PROBE_DISPLAY` / `--probe-display` | `$DISPLAY` | X display for the latency probe window |
-| `--encoder` | `auto` | `nvenc`, `vaapi` or `software` |
+| `SKYLIGHT_ENCODER` / `--encoder` | `auto` | `nvenc`, `vaapi` or `software`; `auto` tries them in that order |
+| `SKYLIGHT_VAAPI_DEVICE` | every `/dev/dri/renderD*` | the render node VA-API should use |
+| `SKYLIGHT_NVENC_DIRECT` | `1` | `0` uses FFmpeg's NVENC wrapper instead of driving NVENC directly |
 | `--max-fps` | 144 | frame-rate cap; clients may ask for less |
 | `--max-mbps` / `--start-mbps` | 50 / 16 | bitrate cap and starting point; the controller adapts in between |
 | `--max-sessions` | 4 | concurrent viewers |
@@ -121,11 +127,48 @@ or from the matching flags (`skylight serve --help`):
 | | Capture | Input | Clipboard |
 |---|---|---|---|
 | `kde` (KWin, Wayland) | `zkde_screencast_unstable_v1` → PipeWire memfd, damage and cursor metadata | `org_kde_kwin_fake_input` | `wlr-data-control` |
-| `x11` | MIT-SHM, driven by XDamage; cursor from XFixes | XTEST | not yet |
+| `x11` | XDamage, then MIT-SHM (or plain GetImage where shared memory is unavailable); cursor from XFixes | XTEST | not yet |
 | `synthetic` | moving test pattern | none | none (used by `bench` and tests) |
 
-Encoders: NVENC (H.264, HEVC, AV1), VAAPI (written, not yet tested on hardware), and x264, x265
-or SVT-AV1 in software. The browser says which codecs it can decode, and H.264 is the default.
+`auto` picks KWin when a Wayland socket is there and KWin's protocols are offered, then X11. A
+GNOME or wlroots Wayland session is refused with a message rather than streamed as a black
+screen: its X display is Xwayland, which is not the desktop.
+
+### Encoders
+
+Tried in this order at runtime; the first that opens wins, so a machine without a GPU (or
+without the vendor's driver) simply ends up on software. `SKYLIGHT_ENCODER` (or `--encoder`) limits
+the search to one family.
+
+| Encoder | Hardware | Bitrate changes | Sharper refinement frames | Keyframe budget boost |
+|---|---|---|---|---|
+| NVENC, driven directly (`nvenc-h264` etc.) | NVIDIA | in place | QP offset map | every forced keyframe |
+| NVENC through FFmpeg (`h264_nvenc`) | NVIDIA | cost a keyframe, so only big moves, at most every 3 s | no | no |
+| VA-API through FFmpeg (`h264_vaapi`) | Intel, AMD | reopen (a keyframe), so only big moves, at most every 3 s | region-of-interest QP offset, where the driver supports ROI | no |
+| x264 | none | in place | region-of-interest QP offset | first keyframe |
+| OpenH264, x265, SVT-AV1 | none | reopen, as VA-API | x265 only | no |
+
+All of them run with no B-frames, no lookahead, no scene-cut keyframes, an infinite GOP
+(keyframes on request only) and one frame in the pipeline at a time; the pacing, damage tracking,
+refinement and the browser side are the same whatever the encoder. VA-API tries each render node
+(machines with an NVIDIA card next to an Intel iGPU have two) and capped VBR before CBR. H.264 is
+the default codec; HEVC and AV1 are used when the browser asks for them and an encoder exists.
+
+The VA-API path is written against FFmpeg's API and is exercised by the fallback logic, but it has
+not been measured on Intel or AMD hardware yet.
+
+Per encoder, on the same test bed as the benchmarks below (virtual X display, 1920×1080, 40 samples
+per input type, medians with p95 in brackets; "glass" is app draw to decoded frame under motion):
+
+| Encoder | Click (ms) | Key (ms) | Glass, animation (ms) | Glass, scrolling text (ms) | Encode (ms) | 10 Mbit/s 40 ms: click / scrolling |
+|---|---|---|---|---|---|---|
+| NVENC direct | 6.6 (7.0) | 6.4 (7.1) | 6.5 (8.4), 59.7 fps | 6.5 (9.4), 59.2 fps | 1.8 | 48.0 / 30.4 ms, 58.5 fps |
+| NVENC through FFmpeg | 8.7 (10.8) | 9.3 (11.0) | 6.5 (8.6), 59.6 fps | 7.3 (10.6), 58.4 fps | 3.0 | 50.0 / 31.6 ms, 58.2 fps |
+| x264 (no GPU) | 12.2 (17.8) | 13.8 (20.1) | 8.1 (12.5), 59.7 fps | 8.7 (13.0), 59.6 fps | 5.3 | 56.0 / 34.1 ms, 53.6 fps |
+
+With a viewer connected to a still screen, the server uses 0.1% of a core on every encoder. A build
+from a clean container with no NVIDIA driver, CUDA or codec headers (`ci/Dockerfile`) picks x264 on
+its own and streams the same test bed at 60 fps.
 
 ## Using it
 
@@ -400,7 +443,11 @@ node scripts/bench.mjs --base https://desk.example.com/   # the same through you
                                  # (set SKYLIGHT_PUBLIC_URL to include the public run)
 node scripts/screenshots.mjs     # the viewer screenshots in docs/results/
 
+scripts/ci.sh                    # build, test, and check no GPU vendor library is linked
+docker build -t skylight-ci ci && docker run --rm -v "$PWD:/src:ro" -e CARGO_TARGET_DIR=/tmp/t \
+  skylight-ci scripts/ci.sh      # the same in a clean container without any vendor packages
 scripts/testbed.sh start         # a second server on a virtual X display, with its own keys
+SKYLIGHT_ENCODER=software scripts/testbed.sh start   # the same, forced onto one encoder family
 scripts/link-bench.sh out/       # against it: loopback, a 47 ms path, 10 and 5 Mbit/s links
 node scripts/netem.mjs --rtt 60 --mbps 5   # just the emulated link, in front of any server
 ```

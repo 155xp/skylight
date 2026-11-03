@@ -3,6 +3,8 @@ mod capture;
 mod clock;
 mod encode;
 mod frame;
+mod h264;
+mod health;
 mod input;
 mod pacer;
 mod probe;

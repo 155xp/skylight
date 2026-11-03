@@ -196,6 +196,8 @@ export class Skylight extends EventTarget {
     this.vcursor = { x: 0, y: 0 };
     this.bench = null;
     this.retry = 0;
+    /** Set for good once the platform decoder held frames or drew black; see `_watchdog`. */
+    this._softwareDecode = false;
     this._build();
     this._bindInput();
     this._measureRefresh();
@@ -594,7 +596,14 @@ export class Skylight extends EventTarget {
     if (m.inputToken) this._openInput(m.inputToken);
     this._ping();
     this._pingTimer = setInterval(() => this._ping(), 1000);
-    this._statsTimer = setInterval(() => this._publishStats(), 1000);
+    this._connectedAt = performance.now();
+    this._shownAt = 0;
+    this._needKey = false;
+    this._health = { stalls: 0, black: 0, reported: '' };
+    this._statsTimer = setInterval(() => {
+      this._publishStats();
+      this._watchdog();
+    }, 1000);
     this._updateCursorMode();
   }
 
@@ -724,13 +733,14 @@ export class Skylight extends EventTarget {
       const cs = codec === 'hevc' ? 'hvc1.1.6.L123.B0' : 'av01.0.08M.08';
       this._configure({ codec: cs, codedWidth: width, codedHeight: height, _for: codec });
     }
-    if (!this.decoder || this.decoder.state !== 'configured') {
+    if (!this.decoder || this.decoder.state !== 'configured' || (this._needKey && !key)) {
       if (!this._askedKey || recv - this._askedKey > 500) {
         this._askedKey = recv;
         this.requestKeyframe();
       }
       return;
     }
+    if (key) this._needKey = false;
     this.pending.set(id, { recv, captureUs, queueUs, encodeUs, refine: (flags & FLAG_REFINE) !== 0, bytes: b.length });
     try {
       this.decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: id, data: chunkData }));
@@ -748,7 +758,11 @@ export class Skylight extends EventTarget {
       });
     }
     try {
-      this.decoder.configure({ ...config, optimizeForLatency: true, hardwareAcceleration: 'no-preference' });
+      this.decoder.configure({
+        ...config,
+        optimizeForLatency: true,
+        hardwareAcceleration: this._softwareDecode ? 'prefer-software' : 'no-preference',
+      });
       this.decoderConfig = { ...config, _for: _for || 'h264' };
     } catch (e) {
       this._decoderFailed(e);
@@ -772,6 +786,7 @@ export class Skylight extends EventTarget {
     // Anything older than this frame was dropped by the decoder.
     for (const k of this.pending.keys()) if (k < id) this.pending.delete(k);
     this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+    this._shownAt = now;
     if (this.bench || this._benchWatch) this._benchCheck(frame, now, meta);
     frame.close();
     if (!meta) return;
@@ -799,6 +814,88 @@ export class Skylight extends EventTarget {
     } else {
       w.refines++;
     }
+  }
+
+  // ---------------------------------------------------------------- watchdog
+
+  /**
+   * Once a second, check that what the server sends reaches the screen. A decoder that sits on
+   * frames is flushed; one that keeps doing it, or that draws black while the server's picture is
+   * not, is swapped for a software decoder. Problems are announced as `health` events, so the host
+   * page can fall back to something else when even that does not help.
+   */
+  _watchdog() {
+    const h = this._health;
+    if (this.state !== 'connected' || !h) return;
+    const now = performance.now();
+    let oldest = Infinity;
+    for (const p of this.pending.values()) oldest = Math.min(oldest, p.recv);
+    if (this.decoder?.state === 'configured' && now - oldest > 1500 && this._shownAt < oldest) {
+      h.stalls++;
+      if (h.stalls >= 2 && !this._softwareDecode) {
+        this._useSoftwareDecoder('decoder-stall', 'the video decoder kept holding frames back');
+      } else {
+        this._report('decoder-stall', `the video decoder held ${this.pending.size} frame(s) back for over 1.5 s`);
+        // flush() hands the held frames out; the decoder then needs a keyframe.
+        this.pending.clear();
+        this._needKey = true;
+        this.decoder.flush().then(() => this.requestKeyframe(), () => {});
+      }
+      return;
+    }
+    if (!this._shownAt) {
+      const waited = now - this._connectedAt;
+      if (waited > 3000 && this.streamInfo) this.requestKeyframe();
+      if (waited > 8000) this._report('no-video', 'connected, but no picture has arrived', true);
+      return;
+    }
+    // The server says how bright its captured picture is; a black canvas next to a bright
+    // picture means the decoder draws black.
+    const serverLuma = this.serverStats.lumaMax;
+    if (serverLuma >= 48 && now - this._shownAt < 30000 && this._canvasLumaMax() < 8) {
+      if (++h.black >= 3) {
+        h.black = 0;
+        if (!this._softwareDecode) this._useSoftwareDecoder('black-output', 'the video decoder draws a black picture');
+        else this._report('black-output', 'the picture stays black even with the software decoder', true);
+      }
+    } else {
+      h.black = 0;
+      if (h.reported) {
+        h.reported = '';
+        this.dispatchEvent(new CustomEvent('health', { detail: { issue: null } }));
+      }
+    }
+  }
+
+  _canvasLumaMax() {
+    if (!this._probe) {
+      const c = document.createElement('canvas');
+      c.width = 32;
+      c.height = 18;
+      this._probe = c.getContext('2d', { willReadFrequently: true });
+    }
+    this._probe.drawImage(this.canvas, 0, 0, 32, 18);
+    const d = this._probe.getImageData(0, 0, 32, 18).data;
+    let max = 0;
+    for (let i = 0; i < d.length; i += 4) max = Math.max(max, (d[i] * 54 + d[i + 1] * 183 + d[i + 2] * 19) >> 8);
+    return max;
+  }
+
+  _useSoftwareDecoder(issue, detail) {
+    this._softwareDecode = true;
+    this._report(issue, `${detail}; switching to the software decoder`);
+    if (this.decoder && this.decoder.state !== 'closed') this.decoder.close();
+    this.decoder = null;
+    this.decoderConfig = null;
+    this.pending.clear();
+    this.requestKeyframe();
+  }
+
+  /** `final`: Skylight has nothing left to try, so the host page may want another transport. */
+  _report(issue, detail, final = false) {
+    if (this._health.reported !== issue) console.warn(`skylight: ${detail}`);
+    this._health.reported = issue;
+    this.dispatchEvent(new CustomEvent('health', { detail: { issue, detail, final } }));
   }
 
   _newWindow() {

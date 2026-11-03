@@ -124,6 +124,31 @@ or from the matching flags (`skylight serve --help`):
 Encoders: NVENC (H.264, HEVC, AV1), VAAPI (written, not yet tested on hardware), and x264, x265
 or SVT-AV1 in software. The browser says which codecs it can decode, and H.264 is the default.
 
+### Staying up
+
+Skylight watches its own picture and repairs it instead of streaming black:
+
+- **Capture.** Every session's encoder thread checks its capture four times a second. The capture
+  is reopened when the source closes or fails (KWin closed the screencast, the PipeWire node went
+  away), when it delivers no first frame within 3 s, when the picture has been black for 3 s, when
+  the pointer moved and the compositor sent nothing back for 2.5 s, or when the monitor changed
+  size or went away. On KWin a reopen alternates between the output stream and a region stream
+  over the same monitor, two separate paths through the compositor. Reopens back off (3 s, 10 s,
+  30 s, up to 5 min) so a desktop that really is black costs almost nothing. After three failed
+  reopens in a row the session ends with an error, so the client reconnects or the host page falls
+  back. If the compositor connection itself drops, the server exits and the service restarts it.
+- **Encoder.** An encoder that fails twice in a row is skipped for a minute in favour of the next
+  one (NVENC, VAAPI, software). The first keyframe from each encoder, then one every 30 s, is
+  decoded on the server and compared with the captured picture; an encoder that sends black is
+  skipped the same way.
+- **Decoder.** H.264 parameter sets always declare that frames are never reordered, so browsers
+  that follow the DPB rules strictly (Chromium's hardware decoders among them) show each frame at
+  once instead of after up to 16 more. The client also flushes a decoder that holds frames and
+  switches to software decoding if the picture stays stuck or black (`health` events, see
+  [INTEGRATION.md](INTEGRATION.md)).
+- **`/healthz`** returns JSON: `status` (`ok` or `degraded`), each running capture (size, frames,
+  ms since the source last sent anything, black or not, error) and the last recoveries.
+
 ## Using it
 
 - **Mac keyboard.** Keys go by physical position (`KeyboardEvent.code` to evdev). Cmd sends Ctrl

@@ -104,6 +104,8 @@ enum StreamEvent {
 
 struct StreamData {
     tx: Mutex<Option<mpsc::Sender<StreamEvent>>>,
+    /// Set once the stream runs, so a later close or failure reaches the sessions reading it.
+    store: Mutex<Option<Arc<FrameStore>>>,
 }
 
 struct ClipState {
@@ -222,8 +224,11 @@ impl KdeBackend {
             .spawn(move || {
                 loop {
                     if let Err(e) = queue.blocking_dispatch(&mut state) {
-                        tracing::error!("Wayland connection lost: {e}");
-                        break;
+                        // Every capture and input path depends on this connection (KWin
+                        // restarted or the session ended). Exit so the service manager starts a
+                        // fresh server that connects again.
+                        tracing::error!("Wayland connection lost, exiting: {e}");
+                        std::process::exit(1);
                     }
                 }
             })?;
@@ -322,12 +327,35 @@ impl Backend for KdeBackend {
     }
 
     fn start_capture(&self, monitor: &MonitorInfo) -> Result<Capture> {
+        self.capture(monitor, monitor.id == "*")
+    }
+
+    /// Odd attempts capture the monitor's rectangle as a region instead of the output itself.
+    /// KWin renders a region stream separately from the output, so a broken output stream (black
+    /// buffers after a mode change or a GPU reset) does not take the region stream with it.
+    fn restart_capture(&self, monitor: &MonitorInfo, attempt: u32) -> Result<Capture> {
+        let region = monitor.id == "*" || (attempt % 2 == 1 && self.screencast.version() >= 3);
+        self.capture(monitor, region)
+    }
+
+    fn input(&self) -> Option<Arc<dyn InputSink>> {
+        self.fake_input.clone().map(|i| i as Arc<dyn InputSink>)
+    }
+
+    fn clipboard(&self) -> Option<Arc<dyn Clipboard>> {
+        self.clipboard.clone().map(|c| c as Arc<dyn Clipboard>)
+    }
+}
+
+impl KdeBackend {
+    fn capture(&self, monitor: &MonitorInfo, region: bool) -> Result<Capture> {
         let (tx, rx) = mpsc::channel();
         let data = StreamData {
             tx: Mutex::new(Some(tx)),
+            store: Mutex::new(None),
         };
         let pointer = sc::Pointer::Metadata as u32;
-        let stream = if monitor.id == "*" {
+        let stream = if region {
             self.screencast.stream_region(
                 monitor.x,
                 monitor.y,
@@ -351,8 +379,11 @@ impl Backend for KdeBackend {
             Ok(StreamEvent::Closed) => bail!("KWin closed the screencast"),
             Err(_) => bail!("KWin did not answer the screencast request"),
         };
-        tracing::info!(monitor = %monitor.id, node, "KWin screencast started");
+        tracing::info!(monitor = %monitor.id, node, region, "KWin screencast started");
         let store = FrameStore::new();
+        if let Some(d) = stream.data::<StreamData>() {
+            *d.store.lock().unwrap() = Some(store.clone());
+        }
         let pw = super::pw::PwCapture::start(
             node,
             store.clone(),
@@ -371,14 +402,6 @@ impl Backend for KdeBackend {
             monitor: monitor.clone(),
             _guard: Box::new(guard),
         })
-    }
-
-    fn input(&self) -> Option<Arc<dyn InputSink>> {
-        self.fake_input.clone().map(|i| i as Arc<dyn InputSink>)
-    }
-
-    fn clipboard(&self) -> Option<Arc<dyn Clipboard>> {
-        self.clipboard.clone().map(|c| c as Arc<dyn Clipboard>)
     }
 }
 
@@ -615,6 +638,13 @@ impl Dispatch<ZkdeScreencastStreamUnstableV1, StreamData> for State {
             sc_stream::Event::Failed { error } => StreamEvent::Failed(error),
             sc_stream::Event::Closed => StreamEvent::Closed,
         };
+        if let Some(store) = data.store.lock().unwrap().as_ref() {
+            match &msg {
+                StreamEvent::Failed(e) => store.set_error(format!("KWin screencast failed: {e}")),
+                StreamEvent::Closed => store.set_error("KWin closed the screencast".into()),
+                StreamEvent::Created(_) => {}
+            }
+        }
         if let Some(tx) = data.tx.lock().unwrap().as_ref() {
             let _ = tx.send(msg);
         }

@@ -150,7 +150,7 @@ pub fn init_logging(verbose: bool) {
 }
 
 /// Names of the encoders to try for a codec and backend, best first.
-fn candidates(codec: Codec, backend: Backend) -> Vec<&'static str> {
+pub fn candidates(codec: Codec, backend: Backend) -> Vec<&'static str> {
     let nv = match codec {
         Codec::H264 => "h264_nvenc",
         Codec::Hevc => "hevc_nvenc",

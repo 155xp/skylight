@@ -53,11 +53,15 @@ the compositor produced the frame; `queue_us` is capture to encode start, `encod
 | `{"t":"settings","maxFps":60,"maxBitrate":8000000,"codec":"hevc"}` | Any subset. Clamped to the server's limits. |
 | `{"t":"monitor","id":"DP-1"}` | Switch displays (refused if the ticket names one). |
 | `{"t":"clipboard","text":"…"}` | Set the remote clipboard (clipboard scope). |
-| `{"t":"bench","action":"start","mode":"click"}` | Open the latency probe window (input scope); `mode` is `move`, `click`, `key` or `animate`. Answered with `{"t":"bench","probe":[x,y,w,h]}` in stream pixels. `"action":"stop"` closes it. |
+| `{"t":"bench","action":"start","mode":"click"}` | Open the latency probe window (input scope); `mode` is `move`, `click`, `key`, `animate` or `scroll`. Answered with `{"t":"bench","probe":[x,y,w,h]}` in stream pixels. `"action":"stop"` closes it. In `animate` and `scroll` modes, the top 48 rows carry a time code: 32 cells of 14×24 px, the server clock in units of 100 µs (black is a 1, most significant bit first), with the complement in the row below. |
 
 The server also sends `{"t":"clipboard","text":"…"}` when the desktop's clipboard changes,
 `{"t":"stats",…}` once a second (encoder, bitrate target, encode time, round trip, frames skipped
 by pacing), and `{"t":"error","message":"…"}`.
+
+Pacing: the server keeps at most about one round trip of frames unacknowledged. A viewer that
+stops acknowledging for 3 seconds (a hidden tab, a reset decoder) is not waited for: the server
+forgets what it had in flight and sends a keyframe. A `keyframe` request does the same at once.
 
 ## Input socket: `/input`
 
@@ -74,6 +78,26 @@ that every binary message is one input event, injected as soon as it is read:
 | `0x15` touch | `u8 type, u8 kind (0 down, 1 move, 2 up, 3 cancel), u8 id, u8 0, f32 x, f32 y` |
 | `0x17` text | `u8 type`, then UTF-8 text, typed with a US layout (phone keyboards) |
 
-The same messages are accepted on the main socket as a fallback while the input socket is not
-open. Keys outside evdev 1–248, and power and sleep keys, are dropped. Every key and button still
+Events that arrive together are injected together, with runs of pointer moves collapsed to the
+last one. The same messages are accepted on the main socket as a fallback while the input socket
+is not open. Keys outside evdev 1–248, and power and sleep keys, are dropped. Every key and button still
 held when a session ends is released.
+
+## HTTP: `/api/screenshot` and `/api/wait`
+
+For programs that drive the desktop (agents, tests). Both take a ticket with the `view` scope as
+`Authorization: Bearer <ticket>` (single use, like any ticket), and an optional `monitor=ID`.
+
+- `GET /api/screenshot` returns the current image as PNG, with `X-Skylight-Seq` set to the frame
+  store's sequence number.
+- `GET /api/wait` returns `{"settled":true,"seq":N,"waitedMs":M}` once the screen has been still
+  for `idle` ms (default 300). With `change`, it returns `{"changed":true,…}` at the first change
+  after `since` (a sequence number, default: when the request arrived), so a change that lands
+  between a screenshot and the wait is not missed. `region=x,y,w,h` (stream pixels) limits both to
+  part of the screen; `timeout` (ms, default 10000) bounds the wait, after which the answer has
+  `false`. It is answered from the capture's damage tracking, without screenshots or polling.
+
+```sh
+curl -H "Authorization: Bearer $(mint)" http://127.0.0.1:5490/api/screenshot > screen.png
+curl -H "Authorization: Bearer $(mint)" "http://127.0.0.1:5490/api/wait?idle=500"
+```

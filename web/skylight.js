@@ -346,6 +346,7 @@ function videoWorker() {
       if (sink) sink.watch = m.on;
     }
   };
+  self.postMessage({ t: typeof VideoDecoder === 'undefined' || typeof OffscreenCanvas === 'undefined' ? 'unsupported' : 'ready' });
 }
 
 /** Source for the worker, built from this module's own code so embedding stays one file. */
@@ -433,6 +434,7 @@ export class Skylight extends EventTarget {
 
   async connect() {
     this._closing = false;
+    await this._videoReady;
     const urls = Array.isArray(this.opts.url) ? this.opts.url : [this.opts.url];
     this._setState('connecting');
     let lastErr = null;
@@ -748,29 +750,60 @@ export class Skylight extends EventTarget {
     this.cursorEl = cursor;
     this.ime = ime;
     // Video goes to a worker with an OffscreenCanvas where possible (opts.worker = false keeps
-    // it on this thread). A page whose CSP forbids blob: workers falls back here too.
+    // it on this thread). The canvas moves over only once the worker has said it runs and has
+    // WebCodecs; a page whose CSP forbids blob: workers falls back to this thread.
     this.worker = null;
-    if (this.opts.worker !== false && typeof Worker !== 'undefined' && 'transferControlToOffscreen' in canvas) {
+    this._sockets = 0;
+    this._wsock = null;
+    this._videoReady = new Promise((resolve) => {
+      const local = () => {
+        this._sink = new VideoSink(canvas, {
+          send: (d) => (typeof d === 'string' ? this.ws && this.ws.readyState === 1 && this.ws.send(d) : this._sendBin(d)),
+          event: (ev) => this._onSinkEvent(ev),
+        });
+        resolve();
+      };
+      if (this.opts.worker === false || typeof Worker === 'undefined' || !('transferControlToOffscreen' in canvas)) {
+        local();
+        return;
+      }
+      let worker;
+      const url = URL.createObjectURL(new Blob([videoWorkerSource()], { type: 'text/javascript' }));
       try {
-        const url = URL.createObjectURL(new Blob([videoWorkerSource()], { type: 'text/javascript' }));
-        const worker = new Worker(url);
+        worker = new Worker(url);
+      } catch {
+        URL.revokeObjectURL(url);
+        local();
+        return;
+      }
+      let settled = false;
+      const fallback = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        URL.revokeObjectURL(url);
+        worker.terminate();
+        local();
+      };
+      const timer = setTimeout(fallback, 3000);
+      worker.onerror = fallback;
+      worker.onmessage = (e) => {
+        if (settled) return;
+        if (e.data.t !== 'ready') {
+          fallback();
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
         URL.revokeObjectURL(url);
         const offscreen = canvas.transferControlToOffscreen();
         worker.postMessage({ t: 'canvas', canvas: offscreen }, [offscreen]);
-        worker.onmessage = (e) => this._onWorker(e.data);
+        worker.onerror = null;
+        worker.onmessage = (ev) => this._onWorker(ev.data);
         this.worker = worker;
-      } catch {
-        this.worker = null;
-      }
-    }
-    this._sockets = 0;
-    this._wsock = null;
-    if (!this.worker) {
-      this._sink = new VideoSink(canvas, {
-        send: (d) => (typeof d === 'string' ? this.ws && this.ws.readyState === 1 && this.ws.send(d) : this._sendBin(d)),
-        event: (ev) => this._onSinkEvent(ev),
-      });
-    }
+        resolve();
+      };
+    });
     this._ro = new ResizeObserver(() => this._layout());
     this._ro.observe(root);
   }

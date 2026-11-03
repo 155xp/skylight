@@ -108,6 +108,7 @@ embed API, all optional except `url` and `ticket`:
 | `cmdKey` | `'ctrl'` | what Cmd sends on a Mac: `'ctrl'` (Cmd+C copies) or `'super'` |
 | `touchMode` | `'trackpad'` | phones: relative pointer like a laptop trackpad, or `'direct'` taps |
 | `scale` | `'fit'` | or `'native'` for one stream pixel per device pixel |
+| `worker` | `true` | decode in a worker so the page's own work never delays a frame; `false` decodes on the page's thread |
 
 Methods: `connect()`, `disconnect()`, `setMonitor(id)`, `setOptions({...})`, `showKeyboard()`
 (call from a tap, opens the iPhone keyboard), `typeText(s)`, `sendKeys([evdev codes])` (for
@@ -121,6 +122,9 @@ The module draws no chrome of its own, so your app keeps its own toolbar and fra
 
 Add each Skylight host to `connect-src` (for example `connect-src 'self' wss://desk.example.com`).
 Keep `data:` in `img-src`: Skylight turns the remote cursor into a `data:` PNG for the CSS cursor.
+Allow `blob:` in `worker-src` (for example `worker-src 'self' blob:`): the video socket and decoder
+run in a worker that skylight.js builds from its own code. Without it Skylight still works, but
+decodes on the page's thread, where a busy page can delay frames.
 WebCodecs needs a secure context, so the page must be served over HTTPS (or from localhost).
 
 ## 4. Network path

@@ -7,11 +7,12 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use axum::Router;
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
+use crate::agent;
 use crate::session::{self, App};
 
 struct Web {
@@ -130,6 +131,22 @@ async fn input_ws(
         .on_upgrade(move |socket| session::run_input(socket, app))
 }
 
+async fn agent_screenshot(
+    State(web): State<Arc<Web>>,
+    headers: HeaderMap,
+    q: Query<agent::ShotQuery>,
+) -> Response {
+    agent::screenshot(State(web.app.clone()), headers, q).await
+}
+
+async fn agent_wait(
+    State(web): State<Arc<Web>>,
+    headers: HeaderMap,
+    q: Query<agent::WaitQuery>,
+) -> Response {
+    agent::wait(State(web.app.clone()), headers, q).await
+}
+
 pub async fn serve(app: Arc<App>, listen: SocketAddr, dir: Option<PathBuf>) -> Result<()> {
     if !listen.ip().is_loopback() {
         bail!(
@@ -143,6 +160,8 @@ pub async fn serve(app: Arc<App>, listen: SocketAddr, dir: Option<PathBuf>) -> R
         .route("/ws", get(ws))
         .route("/input", get(input_ws))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/api/screenshot", get(agent_screenshot))
+        .route("/api/wait", get(agent_wait))
         .with_state(web);
     use axum::serve::ListenerExt;
     // Small writes (input, acks, the tail of a frame) must never wait for Nagle.

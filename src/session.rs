@@ -662,6 +662,8 @@ async fn start_probe(
 /// Re-encode the last image at a higher bitrate once the screen has been still this long, so
 /// text sharpens after scrolling or dragging stops.
 const REFINE_AFTER: Duration = Duration::from_millis(120);
+/// ...and at least this long after the last input event (µs).
+const REFINE_QUIET_US: u64 = 300_000;
 const REFINE_FRAMES: u8 = 3;
 
 /// How much to lower the QP of refinement frame `n` (0-based), where the encoder allows it.
@@ -856,18 +858,24 @@ fn encoder_loop(
         let pending = !new_content && store.pending();
         // Refinements go one at a time, each after the previous frame was acknowledged: on a
         // slow link a burst of them would sit in front of the frame that answers the next click.
+        // They also wait for a pause in input, so text sharpens once typing stops rather than
+        // between keystrokes.
         let link_idle = sh.pacer.lock().unwrap().inflight() == 0;
+        let input_quiet = Duration::from_micros(REFINE_QUIET_US).saturating_sub(
+            Duration::from_micros(now_us.saturating_sub(last_input_us.load(Ordering::Relaxed))),
+        );
+        let refine_wait = REFINE_AFTER
+            .saturating_sub(now.duration_since(last_content))
+            .max(input_quiet);
         let refine_due = cfg.refine
             && refine_left > 0
             && !new_content
             && !pending
             && link_idle
-            && now.duration_since(last_content) >= REFINE_AFTER;
+            && refine_wait.is_zero();
         if !new_content && !pending && !need_key && !refine_due {
             if cfg.refine && refine_left > 0 && link_idle {
-                timeout = REFINE_AFTER
-                    .saturating_sub(now.duration_since(last_content))
-                    .max(Duration::from_millis(1));
+                timeout = refine_wait.max(Duration::from_millis(1));
             }
             continue;
         }

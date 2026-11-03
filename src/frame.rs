@@ -37,6 +37,10 @@ impl Rect {
     }
 
     /// Clamp to a `width` x `height` surface; `None` when nothing is left.
+    pub fn intersects(&self, o: &Rect) -> bool {
+        self.x < o.x + o.w && o.x < self.x + self.w && self.y < o.y + o.h && o.y < self.y + self.h
+    }
+
     pub fn clamp(&self, width: u32, height: u32) -> Option<Rect> {
         if self.x >= width || self.y >= height {
             return None;
@@ -122,7 +126,8 @@ pub struct StoreState {
     pub seq: u64,
     /// Bumped when size or format changes; consumers then take a full copy.
     pub generation: u32,
-    damage: VecDeque<(u64, Rect)>,
+    /// Recent damage: sequence number, rectangle, and capture time (server clock, µs).
+    damage: VecDeque<(u64, Rect, u64)>,
     /// Oldest sequence number whose damage is still in the log.
     damage_floor: u64,
     /// Capture time of the newest content, in the server clock (µs).
@@ -303,10 +308,10 @@ impl FrameStore {
             st.seq += 1;
             let seq = st.seq;
             for r in rects {
-                st.damage.push_back((seq, r));
+                st.damage.push_back((seq, r, capture_us));
             }
             while st.damage.len() > DAMAGE_LOG {
-                let (s, _) = st.damage.pop_front().unwrap();
+                let (s, _, _) = st.damage.pop_front().unwrap();
                 st.damage_floor = s;
             }
             st.capture_us = capture_us;
@@ -345,6 +350,40 @@ impl FrameStore {
     pub fn set_error(&self, err: String) {
         self.state.lock().unwrap().error = Some(err);
         self.notify(WAKE_FRAME);
+    }
+
+    /// Whether anything inside `region` (everything when `None`) changed after `seq`.
+    pub fn changed_since(&self, seq: u64, region: Option<Rect>) -> bool {
+        let st = self.state.lock().unwrap();
+        if st.seq <= seq {
+            return false;
+        }
+        if seq < st.damage_floor {
+            return true;
+        }
+        st.damage
+            .iter()
+            .rev()
+            .take_while(|(s, _, _)| *s > seq)
+            .any(|(_, r, _)| region.is_none_or(|g| g.intersects(r)))
+    }
+
+    /// When `region` last changed (server clock, µs). If the damage log no longer reaches back
+    /// that far, the time of its oldest entry, which is later than the real answer.
+    pub fn last_change(&self, region: Option<Rect>) -> u64 {
+        let st = self.state.lock().unwrap();
+        st.damage
+            .iter()
+            .rev()
+            .find(|(_, r, _)| region.is_none_or(|g| g.intersects(r)))
+            .or(st.damage.front())
+            .map_or(st.capture_us, |(_, _, t)| *t)
+    }
+
+    /// A copy of the current image: width, height, format, pixels (stride = width * 4), seq.
+    pub fn snapshot(&self) -> Option<(u32, u32, PixelFormat, Vec<u8>, u64)> {
+        let st = self.state.lock().unwrap();
+        (st.width > 0).then(|| (st.width, st.height, st.format, st.data.clone(), st.seq))
     }
 
     /// Size, format and generation of the current image.
@@ -387,7 +426,7 @@ impl FrameStore {
         let mut full = st.generation != last_gen || last_seq < st.damage_floor;
         if !full {
             let mut total = 0u64;
-            for (s, r) in st.damage.iter().rev() {
+            for (s, r, _) in st.damage.iter().rev() {
                 if *s <= last_seq {
                     break;
                 }

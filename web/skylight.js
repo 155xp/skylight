@@ -1015,8 +1015,9 @@ export class Skylight extends EventTarget {
     clearInterval(this._statsTimer);
     this._releaseAll();
     if (this.inputWs) this.inputWs.close();
+    if (this._inputReady) this._inputReady.close();
     this.inputWs = null;
-    this._inputQueue = null;
+    this._inputReady = null;
     clearTimeout(this._inputTimer);
     if (this._sink) this._sink.close();
     this.decoderConfig = null;
@@ -1050,60 +1051,68 @@ export class Skylight extends EventTarget {
 
   /** Input gets its own socket so a click never queues behind acks or control messages. */
   /**
-   * Input travels on its own socket, but only ever on one socket at a time: while it opens, input
-   * is held and then sent in order on it. Split across two sockets, a button press could overtake
-   * its own release (a lost click or a stuck button right after connecting). If it cannot open,
-   * everything goes on the main socket for the rest of the session.
+   * Input starts on the main socket and moves to its own socket once that is open, at a moment
+   * when nothing is pressed and no button or key has changed for a while. Two sockets do not keep
+   * order between them, so a press must never go on one and its release on the other (a lost click
+   * or a stuck button right after connecting). Through a tunnel the second socket can take a second
+   * to open; input works on the main socket meanwhile.
    */
   _openInput(token, attempt = 0) {
     if (attempt === 0) {
       this._lastPointer = null;
-      this._inputQueue = [];
-      clearTimeout(this._inputTimer);
-      this._inputTimer = setTimeout(() => this._inputOnMain(), 2000);
+      this._held = new Set();
+      this._lastDiscrete = 0;
     }
-    if (!this._inputQueue) return;
     const url = this._url.replace(/\/ws(\?.*)?$/, '/input');
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
     let opened = false;
     ws.onopen = () => {
-      if (!this._inputQueue) {
-        ws.close();
-        return;
-      }
       opened = true;
-      clearTimeout(this._inputTimer);
       ws.send(JSON.stringify({ token }));
-      for (const b of this._inputQueue) ws.send(b);
-      this._inputQueue = null;
-      this.inputWs = ws;
+      this._inputReady = ws;
+      this._maybeSwitchInput();
     };
     ws.onclose = () => {
       if (this.inputWs === ws) this.inputWs = null;
-      // The token is unspent if the socket never opened.
-      if (opened) return;
-      if (attempt < 3 && this.ws) setTimeout(() => this._openInput(token, attempt + 1), 200);
-      else this._inputOnMain();
+      if (this._inputReady === ws) this._inputReady = null;
+      // The token is unspent if the socket never opened; input stays on the main socket meanwhile.
+      if (!opened && attempt < 3 && this.ws) setTimeout(() => this._openInput(token, attempt + 1), 200);
     };
   }
 
-  /** The input socket did not open: send what waited, and everything after, on the main socket. */
-  _inputOnMain() {
-    const q = this._inputQueue;
-    this._inputQueue = null;
-    clearTimeout(this._inputTimer);
-    if (q && this.ws && this.ws.readyState === 1) for (const b of q) this.ws.send(b);
+  /** Move input to its own socket when doing so cannot reorder a press and its release. */
+  _maybeSwitchInput() {
+    const ws = this._inputReady;
+    if (!ws || ws.readyState !== 1) return;
+    const quiet = performance.now() - this._lastDiscrete;
+    if (this._held.size === 0 && quiet >= 300) {
+      this.inputWs = ws;
+      this._inputReady = null;
+    } else {
+      clearTimeout(this._inputTimer);
+      this._inputTimer = setTimeout(() => this._maybeSwitchInput(), Math.max(50, 300 - quiet));
+    }
   }
 
   _sendInput(buf) {
-    if (this.inputWs && this.inputWs.readyState === 1) {
-      this.inputWs.send(buf);
-    } else if (this._inputQueue) {
-      if (this._inputQueue.length < 1024) this._inputQueue.push(buf);
-    } else if (this.ws && this.ws.readyState === 1) {
-      this.ws.send(buf);
+    const b = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    if (b[0] === IN_BUTTON || b[0] === IN_KEY || b[0] === IN_TEXT || b[0] === IN_TOUCH) {
+      this._lastDiscrete = performance.now();
+      // What is pressed: buttons, keys, and touches between down (0) and up or cancel (2, 3).
+      const held =
+        b[0] === IN_BUTTON ? [`b${b[1]}`, b[2] === 1]
+        : b[0] === IN_KEY ? [`k${b[2] | (b[3] << 8)}`, b[1] === 1]
+        : b[0] === IN_TOUCH && b[1] !== 1 ? [`t${b[2]}`, b[1] === 0]
+        : null;
+      if (held && this._held) {
+        if (held[1]) this._held.add(held[0]);
+        else this._held.delete(held[0]);
+      }
     }
+    const ws = this.inputWs && this.inputWs.readyState === 1 ? this.inputWs : this.ws;
+    if (ws && ws.readyState === 1) ws.send(buf);
+    if (this._inputReady) this._maybeSwitchInput();
   }
 
   _ping() {

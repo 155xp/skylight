@@ -16,6 +16,11 @@ pub fn now_us() -> u64 {
     start().elapsed().as_micros() as u64
 }
 
+/// Where `now_us` is zero on CLOCK_MONOTONIC, for helper processes that stamp times in it.
+pub fn origin_monotonic_ns() -> u64 {
+    monotonic_ns().saturating_sub(now_us() * 1000)
+}
+
 /// CLOCK_MONOTONIC in nanoseconds, the clock PipeWire stamps buffers with.
 pub fn monotonic_ns() -> u64 {
     let mut ts = libc::timespec {

@@ -21,8 +21,13 @@ pub enum Mode {
     Move,
     Click,
     Key,
-    /// Redraws continuously (a bar sweeping across), for frame-rate and bandwidth tests.
+    /// Redraws continuously (a bar sweeping across), for frame-rate and bandwidth tests. A strip
+    /// along the top carries the time of each redraw (see [`TIMECODE_BITS`]), so the browser can
+    /// time every frame from the app drawing it to the viewer showing it.
     Animate,
+    /// Like `Animate`, but a large window of text scrolling smoothly, the way a terminal or a web
+    /// page scrolls: much more detail per frame, for bandwidth and slow-link tests.
+    Scroll,
 }
 
 impl Mode {
@@ -32,10 +37,18 @@ impl Mode {
             "click" => Some(Mode::Click),
             "key" => Some(Mode::Key),
             "animate" => Some(Mode::Animate),
+            "scroll" => Some(Mode::Scroll),
             _ => None,
         }
     }
 }
+
+/// The time code: 32 cells along the top of the animated probe, each `TIMECODE_CELL` pixels wide.
+/// The top row is the server clock in units of 100 µs (black is a 1, most significant bit first),
+/// the row under it is its complement, so a frame captured halfway through a redraw is rejected.
+pub const TIMECODE_BITS: u32 = 32;
+pub const TIMECODE_CELL: u16 = 14;
+pub const TIMECODE_ROW: u16 = 24;
 
 fn atom(conn: &impl Connection, name: &str) -> Result<Atom> {
     Ok(conn.intern_atom(false, name.as_bytes())?.reply()?.atom)
@@ -161,27 +174,72 @@ pub fn run(x: i32, y: i32, size: u16, mode: Mode) -> Result<()> {
         conn.flush()?;
         Ok(())
     };
-    if mode == Mode::Animate {
+    if mode == Mode::Animate || mode == Mode::Scroll {
         // Sweep a black bar across a shifting grey, as fast as the X server takes it; the
         // compositor turns that into one new frame per display refresh.
         let start = std::time::Instant::now();
+        // The server clock's zero on CLOCK_MONOTONIC, so the time code is in the server's clock.
+        let origin_ns: u64 = std::env::var("SKYLIGHT_CLOCK_ORIGIN_NS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         loop {
             while conn.poll_for_event()?.is_some() {}
             let t = start.elapsed().as_secs_f64();
-            let shade = (128.0 + 100.0 * (t * 2.0).sin()) as u32;
-            let grey = (shade << 16) | (shade << 8) | shade;
-            fill(grey)?;
-            let x = ((t * 600.0) as u32 % (size as u32 + 40)) as i16 - 40;
-            conn.poly_fill_rectangle(
-                win,
-                gc,
-                &[Rectangle {
+            if mode == Mode::Scroll {
+                // 300 px/s of 20 px lines; each line's text depends on its index, so content
+                // really moves instead of repeating.
+                fill(white)?;
+                let pos = (t * 300.0) as i64;
+                let first = pos / 20;
+                let mut row = 48 + 18 - (pos % 20) as i16;
+                let mut i = first;
+                while row < size as i16 + 20 {
+                    let line: Vec<u8> = (0..(size as usize / 10))
+                        .map(|c| {
+                            let h = (i as usize).wrapping_mul(2654435761) ^ c.wrapping_mul(40503);
+                            if (h >> 7) % 6 == 0 { b' ' } else { b'!' + ((h >> 3) % 90) as u8 }
+                        })
+                        .collect();
+                    conn.image_text8(win, gc, 2, row, &line)?;
+                    row += 20;
+                    i += 1;
+                }
+            } else {
+                let shade = (128.0 + 100.0 * (t * 2.0).sin()) as u32;
+                let grey = (shade << 16) | (shade << 8) | shade;
+                fill(grey)?;
+                let x = ((t * 600.0) as u32 % (size as u32 + 40)) as i16 - 40;
+                conn.poly_fill_rectangle(
+                    win,
+                    gc,
+                    &[Rectangle {
+                        x,
+                        y: 0,
+                        width: 40,
+                        height: size,
+                    }],
+                )?;
+            }
+            let code = (crate::clock::monotonic_ns().saturating_sub(origin_ns) / 100_000) as u32;
+            let mut ones = Vec::new();
+            let mut zeros = Vec::new();
+            for bit in 0..TIMECODE_BITS {
+                let x = (bit as u16 * TIMECODE_CELL) as i16;
+                let set = code >> (TIMECODE_BITS - 1 - bit) & 1 == 1;
+                let cell = |row: u16| Rectangle {
                     x,
-                    y: 0,
-                    width: 40,
-                    height: size,
-                }],
-            )?;
+                    y: (row * TIMECODE_ROW) as i16,
+                    width: TIMECODE_CELL,
+                    height: TIMECODE_ROW,
+                };
+                ones.push(cell(if set { 0 } else { 1 }));
+                zeros.push(cell(if set { 1 } else { 0 }));
+            }
+            conn.change_gc(gc, &ChangeGCAux::new().foreground(white))?;
+            conn.poly_fill_rectangle(win, gc, &zeros)?;
+            conn.change_gc(gc, &ChangeGCAux::new().foreground(black))?;
+            conn.poly_fill_rectangle(win, gc, &ones)?;
             conn.flush()?;
             if !reported && start.elapsed() > std::time::Duration::from_millis(250) {
                 let pos = conn.translate_coordinates(win, root, 0, 0)?.reply()?;

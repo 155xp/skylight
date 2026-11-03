@@ -191,6 +191,8 @@ export class Skylight extends EventTarget {
     this.cursor = { x: 0, y: 0, visible: true, url: null, hotX: 0, hotY: 0, w: 0, h: 0, rgba: null };
     this.pressedKeys = new Set();
     this.clock = { offset: 0, bestRtt: Infinity, samples: [] };
+    /** Everything that arrived on the main socket, for idle-cost checks. */
+    this.received = { messages: 0, bytes: 0 };
     this.win = this._newWindow();
     this.view = { scale: 1, tx: 0, ty: 0 };
     this.vcursor = { x: 0, y: 0 };
@@ -378,6 +380,75 @@ export class Skylight extends EventTarget {
     return { mode, samples: decoded.length, failed, decoded: sum(decoded), shown: sum(shown) };
   }
 
+  /**
+   * Glass-to-glass latency under motion. The animated probe stamps every redraw with the server
+   * clock in a strip of black and white cells; this reads the strip out of each decoded frame and
+   * times it against the local clock (through the ping clock offset). Returns the time from the
+   * app drawing a frame to it being decoded here and to the next display refresh, and how many
+   * distinct redraws arrived per second.
+   */
+  async measureGlass({ seconds = 10, mode = 'animate' } = {}) {
+    const probe = await this.showProbe(mode);
+    const tc = { probe, decoded: [], shown: [], codes: new Set(), bad: 0, start: 0 };
+    await new Promise((r) => setTimeout(r, 1000));
+    tc.start = performance.now();
+    this._timecode = tc;
+    await new Promise((r) => setTimeout(r, seconds * 1000));
+    this._timecode = null;
+    const secs = (performance.now() - tc.start) / 1000;
+    await this.showProbe(null);
+    const sum = (v) => ({ median: median(v), p95: percentile(v, 0.95), min: Math.min(...v), max: Math.max(...v) });
+    return { samples: tc.decoded.length, uniqueFps: tc.codes.size / secs, rejected: tc.bad, decoded: sum(tc.decoded), shown: sum(tc.shown) };
+  }
+
+  _timecodeCheck(frame, now) {
+    const tc = this._timecode;
+    const [x, y] = tc.probe;
+    const rect = { x: x & ~1, y: y & ~1, width: (32 * 14 + 2) & ~1, height: 48 };
+    let copy;
+    try {
+      copy = frame.clone();
+    } catch {
+      return;
+    }
+    const buf = new Uint8Array(copy.allocationSize({ rect }));
+    const job = (this._tcChain || Promise.resolve()).then(async () => {
+      try {
+        const layout = await copy.copyTo(buf, { rect });
+        const { offset, stride } = layout[0];
+        const rgb = !(copy.format || '').match(/^(I4|NV12)/);
+        const luma = (cx, cy) => {
+          const i = offset + cy * stride + cx * (rgb ? 4 : 1);
+          return rgb ? (buf[i] + buf[i + 1] + buf[i + 2]) / 3 : buf[i];
+        };
+        let code = 0;
+        for (let bit = 0; bit < 32; bit++) {
+          const cx = (x - rect.x) + bit * 14 + 7;
+          const top = luma(cx, (y - rect.y) + 12);
+          const bottom = luma(cx, (y - rect.y) + 36);
+          if (Math.abs(top - bottom) < 60) {
+            tc.bad++;
+            return;
+          }
+          code = code * 2 + (top < bottom ? 1 : 0);
+        }
+        if (this._timecode !== tc || tc.codes.has(code)) return;
+        tc.codes.add(code);
+        // 100 µs units of the server clock, 32 bits; unwrap against the frame's arrival.
+        const nowServerUs = (now + this.clock.offset) * 1000;
+        const span = 2 ** 32 * 100;
+        let drawnUs = code * 100;
+        drawnUs += Math.round((nowServerUs - drawnUs) / span) * span;
+        const drawn = drawnUs / 1000 - this.clock.offset;
+        tc.decoded.push(now - drawn);
+        requestAnimationFrame((t) => tc.shown.push(Math.max(t, now) - drawn));
+      } finally {
+        copy.close();
+      }
+    });
+    this._tcChain = job.catch(() => {});
+  }
+
   /** Open the probe window in a mode (e.g. 'animate' for a moving test pattern); null closes it. */
   showProbe(mode) {
     if (!mode) {
@@ -517,6 +588,8 @@ export class Skylight extends EventTarget {
         }));
       };
       ws.onmessage = (ev) => {
+        this.received.messages++;
+        this.received.bytes += typeof ev.data === 'string' ? ev.data.length : ev.data.byteLength;
         if (typeof ev.data === 'string') {
           const m = JSON.parse(ev.data);
           if (!settled) {
@@ -773,6 +846,7 @@ export class Skylight extends EventTarget {
     for (const k of this.pending.keys()) if (k < id) this.pending.delete(k);
     this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
     if (this.bench || this._benchWatch) this._benchCheck(frame, now, meta);
+    if (this._timecode) this._timecodeCheck(frame, now);
     frame.close();
     if (!meta) return;
     const ack = new ArrayBuffer(12);

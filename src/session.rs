@@ -557,10 +557,10 @@ async fn start_probe(
     mode: probe::Mode,
 ) -> anyhow::Result<(tokio::process::Child, [u32; 4])> {
     use tokio::io::AsyncBufReadExt;
-    let size = if mode == probe::Mode::Animate {
-        480u32
-    } else {
-        160
+    let size = match mode {
+        probe::Mode::Animate => 480u32,
+        probe::Mode::Scroll => 960,
+        _ => 160,
     };
     let exe = std::env::current_exe()?;
     let mode = match mode {
@@ -568,6 +568,7 @@ async fn start_probe(
         probe::Mode::Click => "click",
         probe::Mode::Key => "key",
         probe::Mode::Animate => "animate",
+        probe::Mode::Scroll => "scroll",
     };
     let mut cmd = tokio::process::Command::new(exe);
     cmd.args([
@@ -584,6 +585,10 @@ async fn start_probe(
     if let Some(d) = &cfg.probe_display {
         cmd.env("DISPLAY", d);
     }
+    cmd.env(
+        "SKYLIGHT_CLOCK_ORIGIN_NS",
+        clock::origin_monotonic_ns().to_string(),
+    );
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true);

@@ -119,6 +119,19 @@ pub fn run(x: i32, y: i32, size: u16, mode: Mode) -> Result<()> {
         AtomEnum::ATOM,
         &[above, skip],
     )?;
+    if matches!(mode, Mode::Animate | Mode::Scroll) {
+        // Nothing to type into: never take keyboard focus from whatever the user is doing (no
+        // input hint, and a zero user time tells the window manager not to activate it on map).
+        conn.change_property32(
+            PropMode::REPLACE,
+            win,
+            AtomEnum::WM_HINTS,
+            AtomEnum::WM_HINTS,
+            &[1, 0, 0, 0, 0, 0, 0, 0, 0],
+        )?;
+        let user_time = atom(&conn, "_NET_WM_USER_TIME")?;
+        conn.change_property32(PropMode::REPLACE, win, user_time, AtomEnum::CARDINAL, &[0])?;
+    }
     let font = conn.generate_id()?;
     if conn.open_font(font, b"10x20")?.check().is_err() {
         conn.open_font(font, b"fixed")?.check()?;

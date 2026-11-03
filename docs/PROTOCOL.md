@@ -57,7 +57,12 @@ the compositor produced the frame; `queue_us` is capture to encode start, `encod
 
 The server also sends `{"t":"clipboard","text":"…"}` when the desktop's clipboard changes,
 `{"t":"stats",…}` once a second (encoder, bitrate target, encode time, round trip, frames skipped
-by pacing), and `{"t":"error","message":"…"}`.
+by pacing, and `lumaMax`, the brightest sampled luma 0-255 of the captured picture, which lets the
+client notice a decoder that draws black), and `{"t":"error","message":"…"}`.
+
+H.264 parameter sets always declare `max_num_reorder_frames = 0`: the server adds the VUI
+`bitstream_restriction` when an encoder leaves it out, because without it a conformant decoder
+holds back up to a full DPB of frames (16 at level 5.1) before it shows the first one.
 
 Pacing: the server keeps at most about one round trip of frames unacknowledged. A viewer that
 stops acknowledging for 3 seconds (a hidden tab, a reset decoder) is not waited for: the server

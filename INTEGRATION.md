@@ -114,7 +114,13 @@ Methods: `connect()`, `disconnect()`, `setMonitor(id)`, `setOptions({...})`, `sh
 (call from a tap, opens the iPhone keyboard), `typeText(s)`, `sendKeys([evdev codes])` (for
 example `[29, 56, 111]` for Ctrl+Alt+Delete), `measureLatency({ mode: 'click' | 'key' | 'move' })`.
 Events: `state` (`connecting`, `connected`, `disconnected`), `stats` (once a second), `monitors`,
-`clipboard`, `error`.
+`clipboard`, `error`, and `health`. The client checks once a second that frames reach the screen:
+a browser decoder that holds frames back is flushed, and one that keeps doing it or draws a black
+picture while the server's is not is replaced by a software decoder. Each problem fires `health`
+with `detail.issue` (`decoder-stall`, `black-output`, `no-video`) and a sentence in
+`detail.detail`; `issue: null` means it cleared. `detail.final` is true when Skylight has nothing
+left to try (no picture 8 s after connecting, or still black with the software decoder): a page
+with a second transport can switch to it then.
 
 The module draws no chrome of its own, so your app keeps its own toolbar and frame.
 

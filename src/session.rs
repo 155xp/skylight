@@ -13,6 +13,8 @@ use crate::capture::{self, Capture, Hub, InputSink, MonitorInfo};
 use crate::clock;
 use crate::encode::{self, Codec, EncoderParams, RateChange, VideoEncoder};
 use crate::frame::{Signal, WAKE_COMMAND, WAKE_STOP};
+use crate::h264;
+use crate::health::{self, OutputCheck, Watchdog};
 use crate::input;
 use crate::nvenc::FrameOpts;
 use crate::pacer::Pacer;
@@ -58,6 +60,10 @@ pub struct InputCtx {
     held: Mutex<HeldKeys>,
     /// Server clock of the last input event; the encoder skips its frame-rate cap right after.
     last_input_us: Arc<AtomicU64>,
+    /// Server clock of the last pointer move to a new spot, which the compositor has to answer
+    /// with a cursor update; the capture watchdog relies on that.
+    last_pointer_us: Arc<AtomicU64>,
+    last_pointer_at: Mutex<(f32, f32)>,
     closed: AtomicBool,
     close: tokio::sync::Notify,
 }
@@ -70,7 +76,19 @@ impl InputCtx {
     /// Inject a batch in order, with runs of pointer moves collapsed to the last one (a backlog
     /// of moves is only worth its end point), then flush once.
     fn handle_batch(&self, batch: Vec<Input>) {
-        self.last_input_us.store(clock::now_us(), Ordering::Relaxed);
+        let now = clock::now_us();
+        self.last_input_us.store(now, Ordering::Relaxed);
+        if let Some(&Input::PointerAbs { x, y }) = batch
+            .iter()
+            .rev()
+            .find(|i| matches!(i, Input::PointerAbs { .. }))
+        {
+            let mut at = self.last_pointer_at.lock().unwrap();
+            if (x - at.0).abs() + (y - at.1).abs() >= 1.0 {
+                *at = (x, y);
+                self.last_pointer_us.store(now, Ordering::Relaxed);
+            }
+        }
         let mon = self.mon.lock().unwrap().clone();
         let mut held = self.held.lock().unwrap();
         let mut it = batch.into_iter().peekable();
@@ -267,7 +285,7 @@ async fn serve(
 ) -> anyhow::Result<()> {
     let wanted_mon = claims.mon.clone().or(monitor);
     let mut mon = app.hub.resolve(wanted_mon.as_deref())?;
-    let mut cap = app.hub.capture(&mon)?;
+    let cap = app.hub.capture(&mon)?;
     let monitors = app.hub.monitors();
     let input_sink = if claims.allows("input") {
         app.hub.backend.input()
@@ -275,12 +293,15 @@ async fn serve(
         None
     };
     let last_input_us = Arc::new(AtomicU64::new(0));
+    let last_pointer_us = Arc::new(AtomicU64::new(0));
     let input = input_sink.map(|sink| {
         Arc::new(InputCtx {
             sink,
             mon: Mutex::new(mon.clone()),
             held: Mutex::new(HeldKeys::default()),
             last_input_us: last_input_us.clone(),
+            last_pointer_us: last_pointer_us.clone(),
+            last_pointer_at: Mutex::new((-1.0, -1.0)),
             closed: AtomicBool::new(false),
             close: tokio::sync::Notify::new(),
         })
@@ -341,13 +362,18 @@ async fn serve(
         decode_us: Mutex::new((0, 0)),
     });
     let codec = pick_codec(app, &codecs);
+    // The encoder thread owns the session's only reference to its capture, so a capture it
+    // replaces (see `Hub::reopen`) closes as soon as the last session lets go of it.
     let enc_thread = {
-        let (shared, out, app, cap) = (shared.clone(), out_tx.clone(), app.clone(), cap.clone());
+        let (shared, out, app) = (shared.clone(), out_tx.clone(), app.clone());
+        let ctx = EncoderCtx {
+            input: input.clone(),
+            last_input_us,
+            last_pointer_us,
+        };
         std::thread::Builder::new()
             .name("encoder".into())
-            .spawn(move || {
-                encoder_loop(shared, cap, out, codec, fps, &app.config, &last_input_us)
-            })?
+            .spawn(move || encoder_loop(shared, cap, out, codec, fps, &app, &ctx))?
     };
 
     let mut clip_rx = clipboard.as_ref().map(|c| {
@@ -415,7 +441,6 @@ async fn serve(
                                             *ctx.mon.lock().unwrap() = m.clone();
                                         }
                                         mon = m;
-                                        cap = c.clone();
                                         shared.send(Cmd::Switch(c));
                                     }
                                     Err(e) => {
@@ -486,7 +511,6 @@ async fn serve(
     }
     shared.sig.raise(WAKE_STOP);
     let _ = tokio::task::spawn_blocking(move || enc_thread.join()).await;
-    drop(cap);
     drop(out_tx);
     let _ = writer.await;
     res
@@ -717,21 +741,68 @@ impl Stats {
 /// cap, so the frame that answers a click or key press never waits for a pacing slot.
 const INPUT_FAST_PATH_US: u64 = 250_000;
 
+/// What the encoder thread shares with the rest of its session.
+struct EncoderCtx {
+    input: Option<Arc<InputCtx>>,
+    last_input_us: Arc<AtomicU64>,
+    last_pointer_us: Arc<AtomicU64>,
+}
+
+/// An encoder that fails this many times in a row is skipped for [`ENCODER_TIMEOUT`].
+const ENCODER_STRIKES: u32 = 2;
+const ENCODER_TIMEOUT: Duration = Duration::from_secs(60);
+/// Decode a keyframe to check the encoder's output at most this often (and always first thing).
+const OUTPUT_CHECK_EVERY: Duration = Duration::from_secs(30);
+/// Give up on a session (so the client reconnects or falls back) after this many failed reopens.
+const MAX_REOPEN_FAILURES: u32 = 3;
+
+/// Open the best encoder for `p`, skipping the ones that recently failed, unless that leaves
+/// nothing to try.
+fn open_encoder(
+    p: &EncoderParams,
+    skip: &HashMap<String, Instant>,
+) -> anyhow::Result<VideoEncoder> {
+    let now = Instant::now();
+    let mut errors = Vec::new();
+    for name in encode::candidates(p.codec, p.backend) {
+        if skip.get(name).is_some_and(|until| now < *until) {
+            continue;
+        }
+        match VideoEncoder::open_named(name, p) {
+            Ok(e) => return Ok(e),
+            Err(e) => errors.push(format!("{name}: {e:#}")),
+        }
+    }
+    VideoEncoder::open(p).map_err(|e| anyhow::anyhow!("{e:#} ({})", errors.join("; ")))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn encoder_loop(
     sh: Arc<Shared>,
     mut cap: Arc<Capture>,
     out: UnboundedSender<Message>,
     mut codec: Codec,
     mut fps: u32,
-    cfg: &Config,
-    last_input_us: &AtomicU64,
+    app: &App,
+    ctx: &EncoderCtx,
 ) {
+    let cfg = &app.config;
+    let last_input_us = &*ctx.last_input_us;
     let mut store = cap.store.clone();
     store.subscribe(&sh.sig);
     let mut _pull = store.pull();
     let mut last_request = Instant::now() - Duration::from_secs(1);
     let mut last_request_seq = u64::MAX;
     let mut pull_slot: Option<Instant> = None;
+    let mut dog = Watchdog::new();
+    let mut cap_since = Instant::now();
+    let mut next_check = Instant::now();
+    let mut reopen_failures = 0u32;
+    // Encoder name -> (failures in a row, skipped until).
+    let mut strikes: HashMap<String, u32> = HashMap::new();
+    let mut skip: HashMap<String, Instant> = HashMap::new();
+    let mut output_check: Option<OutputCheck> = None;
+    let mut last_output_check: Option<Instant> = None;
     let mut enc: Option<VideoEncoder> = None;
     let (mut last_seq, mut last_gen) = (0u64, u32::MAX);
     let mut frame_id = 0u32;
@@ -788,6 +859,66 @@ fn encoder_loop(
                     last_gen = u32::MAX;
                     cursor_serial = u32::MAX;
                     cursor_pos = None;
+                    dog = Watchdog::new();
+                    cap_since = Instant::now();
+                }
+            }
+        }
+
+        // Watchdog: replace a capture that closed, never started, went black or stopped
+        // answering the pointer, or whose monitor changed.
+        let now = Instant::now();
+        if now >= next_check {
+            next_check = now + Duration::from_millis(250);
+            let reason = {
+                let st = store.lock();
+                dog.check(
+                    &st,
+                    now.duration_since(cap_since),
+                    ctx.last_pointer_us.load(Ordering::Relaxed),
+                    now,
+                    clock::now_us(),
+                )
+            }
+            .or_else(|| match app.hub.resolve(Some(&cap.monitor.id)) {
+                Ok(m)
+                    if m.width != cap.monitor.width
+                        || m.height != cap.monitor.height
+                        || (m.x, m.y) != (cap.monitor.x, cap.monitor.y) =>
+                {
+                    Some("the display changed")
+                }
+                Err(_) => Some("the display went away"),
+                _ => None,
+            });
+            if let Some(reason) = reason {
+                dog.reopened(now);
+                match app.hub.reopen(&cap, reason) {
+                    Ok(c) => {
+                        reopen_failures = 0;
+                        if let Some(input) = &ctx.input {
+                            *input.mon.lock().unwrap() = c.monitor.clone();
+                        }
+                        cap = c;
+                        store = cap.store.clone();
+                        store.subscribe(&sh.sig);
+                        _pull = store.pull();
+                        last_seq = 0;
+                        last_gen = u32::MAX;
+                        cursor_serial = u32::MAX;
+                        cursor_pos = None;
+                        need_key = true;
+                        cap_since = Instant::now();
+                    }
+                    Err(e) => {
+                        reopen_failures += 1;
+                        if reopen_failures >= MAX_REOPEN_FAILURES {
+                            let message = format!("capture: {e:#}");
+                            let _ = out
+                                .send(text(proto::json(&ServerMsg::Error { message: &message })));
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -795,10 +926,6 @@ fn encoder_loop(
         // Cursor: shape when it changes, position always (it is 12 bytes).
         {
             let st = store.lock();
-            if let Some(err) = &st.error {
-                let _ = out.send(text(proto::json(&ServerMsg::Error { message: err })));
-                return;
-            }
             if let Some(shape) = &st.cursor_shape
                 && shape.serial != cursor_serial
             {
@@ -858,7 +985,8 @@ fn encoder_loop(
         if stats.since.elapsed() >= Duration::from_secs(1) {
             let frames_in = store.lock().frames_in;
             stats.captured = frames_in.saturating_sub(stats.frames_in_at_start);
-            send_stats(&out, &sh, &mut stats, enc.as_ref(), now_us);
+            let luma = store.lock().luma_max;
+            send_stats(&out, &sh, &mut stats, enc.as_ref(), now_us, luma);
             stats.frames_in_at_start = frames_in;
         }
 
@@ -948,10 +1076,11 @@ fn encoder_loop(
                 cq: cfg.cq,
                 ..Default::default()
             };
-            match VideoEncoder::open(&params) {
+            match open_encoder(&params, &skip) {
                 Ok(e) => {
                     tracing::info!(encoder = %e.name, width = w, height = h, fps, "encoder open");
                     enc = Some(e);
+                    last_output_check = None;
                 }
                 Err(e) => {
                     let _ = out.send(text(proto::json(&ServerMsg::Error {
@@ -985,6 +1114,7 @@ fn encoder_loop(
             let _ = out.send(text(proto::json(&m)));
         }
 
+        let source_luma = store.lock().luma_max;
         let (buf, stride) = match e.input() {
             Ok(b) => b,
             Err(err) => {
@@ -1023,11 +1153,29 @@ fn encoder_loop(
         let key = match e.encode_with(opts, &mut payload) {
             Ok(k) => k,
             Err(err) => {
-                tracing::error!("encode failed: {err:#}");
+                let name = e.name.clone();
+                let n = strikes.entry(name.clone()).or_insert(0);
+                *n += 1;
+                tracing::error!(encoder = %name, strikes = *n, "encode failed: {err:#}");
+                if *n >= ENCODER_STRIKES {
+                    *n = 0;
+                    skip.insert(name.clone(), Instant::now() + ENCODER_TIMEOUT);
+                    app.hub.incidents.record(
+                        &cap.monitor.id,
+                        format!("encoder {name} keeps failing ({err:#}); trying the next one"),
+                    );
+                }
                 enc = None;
+                need_key = true;
                 continue;
             }
         };
+        strikes.remove(&e.name);
+        if e.codec == Codec::H264
+            && let Some(fixed) = h264::no_reorder(&payload)
+        {
+            payload = fixed;
+        }
         let encode_us = t0.elapsed().as_micros() as u64;
         if refine {
             refine_left -= 1;
@@ -1086,6 +1234,39 @@ fn encoder_loop(
         if out.send(Message::Binary(msg.into())).is_err() {
             break;
         }
+        if source_luma >= health::BLACK_LUMA {
+            dog.healthy();
+        }
+
+        // Now and then, decode a keyframe and make sure the encoder's picture is not black when
+        // the captured one is not. An encoder that fails this is dropped for the next in line.
+        if key
+            && source_luma >= 48
+            && last_output_check.is_none_or(|t| t.elapsed() >= OUTPUT_CHECK_EVERY)
+        {
+            last_output_check = Some(Instant::now());
+            if output_check.as_ref().is_none_or(|c| c.codec != e.codec) {
+                output_check = OutputCheck::new(e.codec);
+            }
+            if let Some(check) = &mut output_check {
+                let got = check.luma_max(&payload);
+                if got.is_none_or(|l| l < health::BLACK_LUMA) {
+                    let name = e.name.clone();
+                    skip.insert(name.clone(), Instant::now() + ENCODER_TIMEOUT);
+                    app.hub.incidents.record(
+                        &cap.monitor.id,
+                        match got {
+                            Some(l) => format!(
+                                "encoder {name} sends a black picture (luma {l}, captured {source_luma}); trying the next one"
+                            ),
+                            None => format!("encoder {name} sends keyframes that do not decode; trying the next one"),
+                        },
+                    );
+                    enc = None;
+                    need_key = true;
+                }
+            }
+        }
     }
 }
 
@@ -1095,6 +1276,7 @@ fn send_stats(
     s: &mut Stats,
     enc: Option<&VideoEncoder>,
     now_us: u64,
+    luma_max: u8,
 ) {
     let secs = s.since.elapsed().as_secs_f64();
     let content = (s.frames - s.refines).max(1) as f64;
@@ -1121,6 +1303,7 @@ fn send_stats(
         "stalls": p.stalls,
         "decodeMs": if dec_n > 0 { dec_sum as f64 / dec_n as f64 / 1000.0 } else { 0.0 },
         "encoder": enc.map(|e| e.name.as_str()).unwrap_or(""),
+        "lumaMax": luma_max,
     });
     drop(p);
     let _ = out.send(text(v.to_string()));

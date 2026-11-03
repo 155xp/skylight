@@ -19,6 +19,7 @@ use anyhow::{Result, bail};
 use serde::Serialize;
 
 use crate::frame::FrameStore;
+use crate::health::Incidents;
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct MonitorInfo {
@@ -84,6 +85,12 @@ pub trait Backend: Send + Sync {
     fn name(&self) -> &'static str;
     fn monitors(&self) -> Vec<MonitorInfo>;
     fn start_capture(&self, monitor: &MonitorInfo) -> Result<Capture>;
+    /// Start a capture after `attempt` earlier ones for this monitor went bad. Backends with more
+    /// than one way to capture alternate between them here.
+    fn restart_capture(&self, monitor: &MonitorInfo, attempt: u32) -> Result<Capture> {
+        let _ = attempt;
+        self.start_capture(monitor)
+    }
     fn input(&self) -> Option<Arc<dyn InputSink>>;
     fn clipboard(&self) -> Option<Arc<dyn Clipboard>>;
 }
@@ -92,6 +99,9 @@ pub trait Backend: Send + Sync {
 pub struct Hub {
     pub backend: Arc<dyn Backend>,
     live: Mutex<HashMap<String, Weak<Capture>>>,
+    /// How many times each monitor's capture has been reopened.
+    restarts: Mutex<HashMap<String, u32>>,
+    pub incidents: Incidents,
 }
 
 impl Hub {
@@ -99,6 +109,8 @@ impl Hub {
         Hub {
             backend,
             live: Mutex::new(HashMap::new()),
+            restarts: Mutex::new(HashMap::new()),
+            incidents: Incidents::default(),
         }
     }
 
@@ -124,12 +136,82 @@ impl Hub {
     pub fn capture(&self, monitor: &MonitorInfo) -> Result<Arc<Capture>> {
         let mut live = self.live.lock().unwrap();
         live.retain(|_, w| w.strong_count() > 0);
-        if let Some(c) = live.get(&monitor.id).and_then(Weak::upgrade) {
+        if let Some(c) = live.get(&monitor.id).and_then(Weak::upgrade)
+            && c.store.lock().error.is_none()
+        {
             return Ok(c);
         }
         let c = Arc::new(self.backend.start_capture(monitor)?);
         live.insert(monitor.id.clone(), Arc::downgrade(&c));
         Ok(c)
+    }
+
+    /// Replace a capture that went bad (see [`crate::health::Watchdog`]). When another session
+    /// already replaced it, that capture is shared instead of opening a third one. A monitor that
+    /// disappeared falls back to the first one left.
+    pub fn reopen(&self, old: &Arc<Capture>, reason: &str) -> Result<Arc<Capture>> {
+        let id = &old.monitor.id;
+        let mut live = self.live.lock().unwrap();
+        if let Some(c) = live.get(id).and_then(Weak::upgrade)
+            && !Arc::ptr_eq(&c, old)
+            && c.store.lock().error.is_none()
+        {
+            return Ok(c);
+        }
+        let monitor = self.resolve(Some(id)).or_else(|_| self.resolve(None))?;
+        let attempt = {
+            let mut r = self.restarts.lock().unwrap();
+            let n = r.entry(id.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        self.incidents.record(
+            id,
+            format!("{reason}: reopening the capture (attempt {attempt})"),
+        );
+        match self.backend.restart_capture(&monitor, attempt) {
+            Ok(c) => {
+                let c = Arc::new(c);
+                live.insert(monitor.id.clone(), Arc::downgrade(&c));
+                Ok(c)
+            }
+            Err(e) => {
+                self.incidents
+                    .record(id, format!("reopening the capture failed: {e:#}"));
+                Err(e)
+            }
+        }
+    }
+
+    /// Live captures and recent recoveries, for `/healthz`.
+    pub fn health(&self) -> serde_json::Value {
+        let now = crate::clock::now_us();
+        let live = self.live.lock().unwrap();
+        let captures: Vec<serde_json::Value> = live
+            .iter()
+            .filter_map(|(id, w)| Some((id, w.upgrade()?)))
+            .map(|(id, c)| {
+                let st = c.store.lock();
+                serde_json::json!({
+                    "monitor": id,
+                    "width": st.width,
+                    "height": st.height,
+                    "frames": st.frames_in,
+                    "idleMs": now.saturating_sub(st.activity_us) / 1000,
+                    "black": st.width > 0 && st.luma_max < crate::health::BLACK_LUMA,
+                    "error": st.error,
+                })
+            })
+            .collect();
+        let healthy = captures
+            .iter()
+            .all(|c| c["error"].is_null() && c["black"] == false && c["frames"] != 0);
+        serde_json::json!({
+            "status": if healthy { "ok" } else { "degraded" },
+            "backend": self.backend.name(),
+            "captures": captures,
+            "incidents": self.incidents.recent(),
+        })
     }
 }
 

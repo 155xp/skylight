@@ -147,6 +147,17 @@ async fn agent_wait(
     agent::wait(State(web.app.clone()), headers, q).await
 }
 
+/// Liveness plus the state of every running capture and the last recoveries (no secrets: monitor
+/// names, sizes, counters). Answers 200 either way; `status` says "ok" or "degraded".
+async fn healthz(State(web): State<Arc<Web>>) -> Response {
+    let mut r = axum::Json(web.app.hub.health()).into_response();
+    r.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    r
+}
+
 pub async fn serve(app: Arc<App>, listen: SocketAddr, dir: Option<PathBuf>) -> Result<()> {
     if !listen.ip().is_loopback() {
         bail!(
@@ -159,7 +170,7 @@ pub async fn serve(app: Arc<App>, listen: SocketAddr, dir: Option<PathBuf>) -> R
         .route("/{file}", get(asset))
         .route("/ws", get(ws))
         .route("/input", get(input_ws))
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz))
         .route("/api/screenshot", get(agent_screenshot))
         .route("/api/wait", get(agent_wait))
         .with_state(web);

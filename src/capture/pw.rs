@@ -271,8 +271,17 @@ fn run(
         .add_local_listener_with_user_data(data)
         .state_changed(move |_, _, old, new| {
             tracing::debug!(?old, ?new, "PipeWire stream state");
-            if let pw::stream::StreamState::Error(e) = new {
-                err_store.set_error(format!("PipeWire stream error: {e}"));
+            match new {
+                pw::stream::StreamState::Error(e) => {
+                    err_store.set_error(format!("PipeWire stream error: {e}"))
+                }
+                // The node went away under a running stream (we only disconnect on drop).
+                pw::stream::StreamState::Unconnected
+                    if !matches!(old, pw::stream::StreamState::Connecting) =>
+                {
+                    err_store.set_error("PipeWire stream disconnected".into())
+                }
+                _ => {}
             }
         })
         .param_changed(|stream, ud, id, param| {
@@ -345,6 +354,7 @@ unsafe fn process(stream: &pw::stream::Stream, ud: &mut UserData) {
 
 unsafe fn handle_buffer(buf: *mut spa_sys::spa_buffer, ud: &mut UserData) {
     unsafe {
+        ud.store.touch();
         let now_us = clock::now_us();
         let mut delay_us = 0u64;
         if let Some(m) = find_meta(buf, spa_sys::SPA_META_Header) {

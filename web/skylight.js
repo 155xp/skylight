@@ -174,6 +174,13 @@ class VideoSink {
     this.pending = new Map();
     this.askedKey = 0;
     this.watch = false;
+    // Watchdog state, see check().
+    this.software = false;
+    this.needKey = false;
+    this.shownAt = 0;
+    this.stalls = 0;
+    this.black = 0;
+    this.probe = null;
   }
 
   static now() {
@@ -214,13 +221,14 @@ class VideoSink {
       const cs = codec === 'hevc' ? 'hvc1.1.6.L123.B0' : 'av01.0.08M.08';
       this.configure({ codec: cs, codedWidth: width, codedHeight: height, _for: codec });
     }
-    if (!this.decoder || this.decoder.state !== 'configured') {
+    if (!this.decoder || this.decoder.state !== 'configured' || (this.needKey && !key)) {
       if (recv - this.askedKey > 500) {
         this.askedKey = recv;
         this.hooks.send(JSON.stringify({ t: 'keyframe' }));
       }
       return;
     }
+    if (key) this.needKey = false;
     this.pending.set(id, {
       recv,
       captureUs: Number(dv.getBigUint64(12, true)),
@@ -242,7 +250,11 @@ class VideoSink {
       this.decoder = new VideoDecoder({ output: (f) => this.onFrame(f), error: (e) => this.failed(e) });
     }
     try {
-      this.decoder.configure({ ...config, optimizeForLatency: true, hardwareAcceleration: 'no-preference' });
+      this.decoder.configure({
+        ...config,
+        optimizeForLatency: true,
+        hardwareAcceleration: this.software ? 'prefer-software' : 'no-preference',
+      });
       this.config = { ...config, _for: _for || 'h264' };
       this.hooks.event({ t: 'config', codec: config.codec });
     } catch (e) {
@@ -265,6 +277,7 @@ class VideoSink {
     for (const k of this.pending.keys()) if (k < id) this.pending.delete(k);
     // Paint on arrival: no waiting for an animation frame, the newest frame simply wins.
     this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+    this.shownAt = now;
     if (meta) {
       const ack = new ArrayBuffer(12);
       const dv = new DataView(ack);
@@ -285,6 +298,71 @@ class VideoSink {
   /** A new stream (codec, size or monitor) starts with its own keyframe. */
   reset() {
     this.config = null;
+    this.shownAt = 0;
+  }
+
+  /**
+   * The watchdog, called once a second while connected: check that what the server sends reaches
+   * the screen. A decoder that sits on frames is flushed; one that keeps doing it, or that draws
+   * black while the server's picture (`luma`, its brightest sampled pixel) is not, is swapped for
+   * a software decoder. Reports `health` events; `connectedMs` is the time since connecting.
+   */
+  check(luma, connectedMs) {
+    const now = VideoSink.now();
+    // `final`: nothing left to try here, so the host page may want another transport.
+    const health = (issue, detail, final = false) => this.hooks.event({ t: 'health', issue, detail, final });
+    let oldest = Infinity;
+    for (const p of this.pending.values()) oldest = Math.min(oldest, p.recv);
+    if (this.decoder?.state === 'configured' && now - oldest > 1500 && this.shownAt < oldest) {
+      if (++this.stalls >= 2 && !this.software) {
+        this.useSoftware();
+        health('decoder-stall', 'the video decoder kept holding frames back; switched to the software decoder');
+      } else {
+        health('decoder-stall', `the video decoder held ${this.pending.size} frame(s) back for over 1.5 s`);
+        // flush() hands the held frames out; the decoder then needs a keyframe.
+        this.pending.clear();
+        this.needKey = true;
+        this.decoder.flush().then(() => this.hooks.send(JSON.stringify({ t: 'keyframe' })), () => {});
+      }
+      return;
+    }
+    if (!this.shownAt) {
+      if (connectedMs > 3000) this.hooks.send(JSON.stringify({ t: 'keyframe' }));
+      if (connectedMs > 8000) health('no-video', 'connected, but no picture has arrived', true);
+      return;
+    }
+    if (luma >= 48 && now - this.shownAt < 30000 && this.lumaMax() < 8) {
+      if (++this.black >= 3) {
+        this.black = 0;
+        if (!this.software) {
+          this.useSoftware();
+          health('black-output', 'the video decoder draws a black picture; switched to the software decoder');
+        } else {
+          health('black-output', 'the picture stays black even with the software decoder', true);
+        }
+      }
+      return;
+    }
+    this.black = 0;
+    health(null, '');
+  }
+
+  lumaMax() {
+    if (!this.probe) {
+      const c = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(32, 18) : Object.assign(document.createElement('canvas'), { width: 32, height: 18 });
+      this.probe = c.getContext('2d', { willReadFrequently: true });
+    }
+    this.probe.drawImage(this.canvas, 0, 0, 32, 18);
+    const d = this.probe.getImageData(0, 0, 32, 18).data;
+    let max = 0;
+    for (let i = 0; i < d.length; i += 4) max = Math.max(max, (d[i] * 54 + d[i + 1] * 183 + d[i + 2] * 19) >> 8);
+    return max;
+  }
+
+  useSoftware() {
+    this.software = true;
+    this.close();
+    this.hooks.send(JSON.stringify({ t: 'keyframe' }));
   }
 
   close() {
@@ -301,6 +379,7 @@ function videoWorker() {
   let ws = null;
   let sink = null;
   let watch = false;
+  let software = false;
   self.onmessage = (e) => {
     const m = e.data;
     if (m.t === 'canvas') {
@@ -316,6 +395,7 @@ function videoWorker() {
         event: (ev, transfer) => self.postMessage({ ...ev, id }, transfer || []),
       });
       sink.watch = watch;
+      sink.software = software;
       const own = sink;
       sock.onopen = () => self.postMessage({ t: 'open', id });
       sock.onmessage = (ev) => {
@@ -344,6 +424,11 @@ function videoWorker() {
     } else if (m.t === 'watch') {
       watch = m.on;
       if (sink) sink.watch = m.on;
+    } else if (m.t === 'check') {
+      if (sink) {
+        sink.check(m.luma, m.connectedMs);
+        software = sink.software;
+      }
     }
   };
   self.postMessage({ t: typeof VideoDecoder === 'undefined' || typeof OffscreenCanvas === 'undefined' ? 'unsupported' : 'ready' });
@@ -425,6 +510,7 @@ export class Skylight extends EventTarget {
     this.vcursor = { x: 0, y: 0 };
     this.bench = null;
     this.retry = 0;
+    this._healthIssue = null;
     this._build();
     this._bindInput();
     this._measureRefresh();
@@ -951,7 +1037,11 @@ export class Skylight extends EventTarget {
     if (m.inputToken) this._openInput(m.inputToken);
     this._ping();
     this._pingTimer = setInterval(() => this._ping(), 1000);
-    this._statsTimer = setInterval(() => this._publishStats(), 1000);
+    this._connectedAt = performance.now();
+    this._statsTimer = setInterval(() => {
+      this._publishStats();
+      this._watchdog();
+    }, 1000);
     this._updateCursorMode();
   }
 
@@ -1085,6 +1175,9 @@ export class Skylight extends EventTarget {
       case 'error':
         this.dispatchEvent(new CustomEvent('error', { detail: m.message }));
         break;
+      case 'health':
+        this._onHealth(m);
+        break;
       case 'vframe': {
         const now = local(m.decoded);
         const meta = m.meta && { ...m.meta, recv: local(m.meta.recv) };
@@ -1125,6 +1218,25 @@ export class Skylight extends EventTarget {
   _watchFrames(on) {
     if (this.worker) this.worker.postMessage({ t: 'watch', on });
     else this._sink.watch = on;
+  }
+
+  // ---------------------------------------------------------------- watchdog
+
+  /** Once a second: let the video sink check that frames reach the screen (see VideoSink.check). */
+  _watchdog() {
+    if (this.state !== 'connected') return;
+    const luma = this.serverStats.lumaMax ?? 0;
+    const connectedMs = performance.now() - this._connectedAt;
+    if (this.worker) this.worker.postMessage({ t: 'check', luma, connectedMs });
+    else if (this._sink) this._sink.check(luma, connectedMs);
+  }
+
+  /** `health` events: an issue the first time it shows, `issue: null` once it clears. */
+  _onHealth(m) {
+    if (m.issue === this._healthIssue) return;
+    this._healthIssue = m.issue;
+    if (m.issue) console.warn(`skylight: ${m.detail}`);
+    this.dispatchEvent(new CustomEvent('health', { detail: { issue: m.issue, detail: m.detail, final: m.final } }));
   }
 
   _newWindow() {

@@ -139,6 +139,12 @@ pub struct StoreState {
     pub error: Option<String>,
     /// Frames received from the capture source, for stats.
     pub frames_in: u64,
+    /// Server clock (µs) of the last sign of life from the source: a frame, or a buffer that only
+    /// moved the cursor. The watchdog compares it with pointer input.
+    pub activity_us: u64,
+    /// Brightest and mean luma (0-255) of the current image, sampled on every update.
+    pub luma_max: u8,
+    pub luma_mean: u8,
 }
 
 /// One monitor's live image, shared by every session watching it.
@@ -191,6 +197,9 @@ impl FrameStore {
                 cursor_shape: None,
                 error: None,
                 frames_in: 0,
+                activity_us: 0,
+                luma_max: 0,
+                luma_mean: 0,
             }),
             subscribers: Mutex::new(Vec::new()),
             requester: Mutex::new(None),
@@ -317,14 +326,24 @@ impl FrameStore {
             st.capture_us = capture_us;
             st.compositor_delay_us = compositor_delay_us;
             st.frames_in += 1;
+            st.activity_us = st.activity_us.max(capture_us);
+            (st.luma_max, st.luma_mean) =
+                crate::health::sample_luma(&st.data, width, height, format);
         }
         self.pending.store(false, Ordering::Relaxed);
         self.notify(WAKE_FRAME);
     }
 
+    /// The source is alive even though nothing changed (for example a cursor-only buffer).
+    pub fn touch(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.activity_us = st.activity_us.max(crate::clock::now_us());
+    }
+
     pub fn set_cursor(&self, pos: CursorPos, shape: Option<CursorShape>) {
         let changed = {
             let mut st = self.state.lock().unwrap();
+            st.activity_us = st.activity_us.max(crate::clock::now_us());
             let mut changed = st.cursor != pos;
             st.cursor = pos;
             if let Some(shape) = shape {

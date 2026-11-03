@@ -1,8 +1,9 @@
 //! X11: MIT-SHM capture driven by XDamage, cursor shape from XFixes, input through XTEST.
 //!
-//! Only damaged regions are read back. XDamage reports the rectangles that changed, the capture
-//! thread waits for those events (no polling while the screen is idle), coalesces them up to the
-//! frame-rate cap and pulls the bounding box over shared memory.
+//! Only damaged regions are read back. XDamage reports each changed rectangle in its event, the
+//! capture thread sleeps until such events arrive (pointer motion comes as XInput 2 events, so an
+//! idle screen costs nothing), coalesces them up to 240 Hz and pulls just the band of rows that
+//! changed over shared memory.
 
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,9 +16,10 @@ use x11rb::protocol::damage::ConnectionExt as _;
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
+use x11rb::protocol::xinput::ConnectionExt as _;
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
 use x11rb::protocol::xtest::ConnectionExt as _;
-use x11rb::protocol::{Event, damage, shm, xfixes, xtest};
+use x11rb::protocol::{Event, damage, shm, xfixes, xinput, xtest};
 use x11rb::rust_connection::RustConnection;
 
 use super::{Backend, Capture, Clipboard, InputSink, MonitorInfo, TouchKind};
@@ -109,7 +111,7 @@ impl Backend for X11Backend {
 
     fn start_capture(&self, monitor: &MonitorInfo) -> Result<Capture> {
         let store = FrameStore::new();
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Waker::new()?;
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (st, flag, mon) = (store.clone(), stop.clone(), monitor.clone());
         std::thread::Builder::new()
@@ -141,11 +143,53 @@ impl Backend for X11Backend {
     }
 }
 
-struct StopOnDrop(Arc<AtomicBool>);
+/// Wakes the capture thread out of `poll`: to stop, or because a viewer wants a frame now.
+struct Waker {
+    stop: AtomicBool,
+    requested: AtomicBool,
+    fd: i32,
+}
+
+impl Waker {
+    fn new() -> Result<Arc<Waker>> {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            bail!("eventfd: {}", std::io::Error::last_os_error());
+        }
+        Ok(Arc::new(Waker {
+            stop: AtomicBool::new(false),
+            requested: AtomicBool::new(false),
+            fd,
+        }))
+    }
+
+    fn wake(&self) {
+        let one = 1u64;
+        unsafe { libc::write(self.fd, &one as *const u64 as *const _, 8) };
+    }
+
+    fn drain(&self) {
+        let mut v = 0u64;
+        unsafe { libc::read(self.fd, &mut v as *mut u64 as *mut _, 8) };
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Waker {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+struct StopOnDrop(Arc<Waker>);
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.0.stop.store(true, Ordering::Relaxed);
+        self.0.wake();
     }
 }
 
@@ -190,10 +234,13 @@ impl Drop for ShmSeg {
     }
 }
 
+/// Without a viewer pulling frames (`skylight bench`), changes are grabbed at up to this rate.
+const PUSH_INTERVAL: Duration = Duration::from_micros(1_000_000 / 240);
+
 fn capture_loop(
     mon: &MonitorInfo,
     store: &FrameStore,
-    stop: &AtomicBool,
+    waker: &Arc<Waker>,
     ready: &std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<()> {
     let (conn, screen) = x11rb::connect(None)?;
@@ -205,44 +252,94 @@ fn capture_loop(
     conn.damage_query_version(1, 1)?.reply()?;
     conn.xfixes_query_version(5, 0)?.reply()?;
     let (w, h) = (mon.width, mon.height);
-    let (seg, shmid) = ShmSeg::new(w as usize * h as usize * 4)?;
+    let stride = w as usize * 4;
+    let (seg, shmid) = ShmSeg::new(stride * h as usize)?;
     let shmseg = conn.generate_id()?;
     conn.shm_attach(shmseg, shmid as u32, false)?.check()?;
     unsafe { libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut()) };
 
+    // One event when the screen goes from unchanged to changed; the region is fetched (and
+    // reset) at grab time. Per-rectangle events would cost the X server an event for every
+    // drawing request, which slows down the very apps being watched.
     let dmg = conn.generate_id()?;
     conn.damage_create(dmg, root, damage::ReportLevel::NON_EMPTY)?;
     let region = conn.generate_id()?;
     conn.xfixes_create_region(region, &[])?;
     conn.xfixes_select_cursor_input(root, xfixes::CursorNotifyMask::DISPLAY_CURSOR)?;
+    // Pointer motion as events (XInput 2 raw motion, which XTEST input produces too), so the
+    // pointer position needs no polling. Without XInput 2, fall back to polling it.
+    let xi2 = conn
+        .extension_information(xinput::X11_EXTENSION_NAME)?
+        .is_some()
+        && conn
+            .xinput_xi_query_version(2, 0)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some()
+        && conn
+            .xinput_xi_select_events(
+                root,
+                &[xinput::EventMask {
+                    deviceid: 1, // all master devices
+                    mask: vec![xinput::XIEventMask::RAW_MOTION],
+                }],
+            )
+            .ok()
+            .and_then(|c| c.check().ok())
+            .is_some();
     conn.flush()?;
+    // Viewers ask for a frame when they are ready to encode one: the grab then happens right
+    // before the encode, so the frame is as fresh as it can be and nothing is grabbed for nobody.
+    {
+        let w = waker.clone();
+        store.set_requester(Box::new(move || {
+            w.requested.store(true, Ordering::Relaxed);
+            w.wake();
+        }));
+    }
     let _ = ready.send(Ok(()));
 
     let mon_rect = (mon.x, mon.y, w as i32, h as i32);
-    let min_interval = Duration::from_micros(1_000_000 / 240);
-    let mut last_grab = Instant::now() - min_interval;
+    let mut last_grab = Instant::now() - PUSH_INTERVAL;
     let mut first = true;
-    let mut dirty = true;
+    let mut dirty = false;
     let mut cursor_dirty = true;
+    let mut pointer_dirty = true;
     let mut last_pointer = (i32::MIN, i32::MIN);
     let mut cursor_serial = 0u32;
     let fd = conn.stream().as_raw_fd();
+    let mut early: Option<Event> = None;
 
-    while !stop.load(Ordering::Relaxed) {
-        while let Some(ev) = conn.poll_for_event()? {
+    while !waker.stopped() {
+        while let Some(ev) = early
+            .take()
+            .map_or_else(|| conn.poll_for_event(), |e| Ok(Some(e)))?
+        {
             match ev {
-                Event::DamageNotify(_) => dirty = true,
+                Event::DamageNotify(_) => {
+                    dirty = true;
+                    store.mark_pending();
+                }
                 Event::XfixesCursorNotify(_) => cursor_dirty = true,
+                Event::XinputRawMotion(_) => pointer_dirty = true,
                 _ => {}
             }
         }
-        if dirty && last_grab.elapsed() >= min_interval {
-            dirty = false;
+        let pulled = store.pulled();
+        let requested = waker.requested.swap(false, Ordering::Relaxed);
+        let due = first
+            || dirty
+                && if pulled {
+                    requested
+                } else {
+                    last_grab.elapsed() >= PUSH_INTERVAL
+                };
+        if due {
             last_grab = Instant::now();
+            dirty = false;
             conn.damage_subtract(dmg, x11rb::NONE, region)?;
-            let rects = conn.xfixes_fetch_region(region)?.reply()?.rectangles;
             let mut damage = Vec::new();
-            for r in rects {
+            for r in conn.xfixes_fetch_region(region)?.reply()?.rectangles {
                 let x0 = (r.x as i32).max(mon_rect.0);
                 let y0 = (r.y as i32).max(mon_rect.1);
                 let x1 = (r.x as i32 + r.width as i32).min(mon_rect.0 + mon_rect.2);
@@ -257,17 +354,25 @@ fn capture_loop(
                 }
             }
             if first || !damage.is_empty() {
+                // Read back only the band of rows that changed, into the same place in the
+                // segment.
+                let band = if first {
+                    Rect::new(0, 0, w, h)
+                } else {
+                    let b = bounds(&damage);
+                    Rect::new(0, b.y, w, b.h)
+                };
                 let t = clock::now_us();
                 conn.shm_get_image(
                     root,
                     mon.x as i16,
-                    mon.y as i16,
+                    (mon.y + band.y as i32) as i16,
                     w as u16,
-                    h as u16,
+                    band.h as u16,
                     !0,
                     xproto::ImageFormat::Z_PIXMAP.into(),
                     shmseg,
-                    0,
+                    (band.y as usize * stride) as u32,
                 )?
                 .reply()?;
                 store.update(
@@ -275,16 +380,20 @@ fn capture_loop(
                     h,
                     PixelFormat::Bgrx,
                     seg.bytes(),
-                    w as usize * 4,
+                    stride,
                     if first { None } else { Some(&damage) },
                     t,
                     0,
                 );
                 first = false;
+            } else {
+                // Damage elsewhere on the X screen (another monitor): nothing for this one.
+                store.clear_pending();
             }
         }
         if cursor_dirty {
             cursor_dirty = false;
+            pointer_dirty = true;
             if let Ok(img) = conn.xfixes_get_cursor_image()?.reply() {
                 cursor_serial += 1;
                 let mut rgba = Vec::with_capacity(img.cursor_image.len() * 4);
@@ -307,6 +416,7 @@ fn capture_loop(
                     y: img.y as i32 - mon.y,
                     visible: true,
                 };
+                last_pointer = (pos.x, pos.y);
                 store.set_cursor(
                     pos,
                     Some(CursorShape {
@@ -321,33 +431,80 @@ fn capture_loop(
             }
         }
         // Pointer position for clients that draw the cursor themselves (touch devices).
-        if let Ok(p) = conn.query_pointer(root)?.reply() {
-            let pos = (p.root_x as i32 - mon.x, p.root_y as i32 - mon.y);
-            if pos != last_pointer {
-                last_pointer = pos;
-                store.set_cursor(
-                    CursorPos {
-                        x: pos.0,
-                        y: pos.1,
-                        visible: true,
-                    },
-                    None,
-                );
+        if pointer_dirty || !xi2 {
+            pointer_dirty = false;
+            if let Ok(p) = conn.query_pointer(root)?.reply() {
+                let pos = (p.root_x as i32 - mon.x, p.root_y as i32 - mon.y);
+                if pos != last_pointer {
+                    last_pointer = pos;
+                    store.set_cursor(
+                        CursorPos {
+                            x: pos.0,
+                            y: pos.1,
+                            visible: true,
+                        },
+                        None,
+                    );
+                }
             }
         }
         conn.flush()?;
-        // Sleep until the X server has something for us, or briefly when a grab is pending.
-        let timeout_ms = if dirty { 1 } else { 16 };
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
+        // Waiting for replies above may have queued events inside the connection, where poll()
+        // cannot see them; handle those before sleeping.
+        if let Some(ev) = conn.poll_for_event()? {
+            early = Some(ev);
+            continue;
+        }
+        // Sleep until the X server has something for us, a viewer asks for a frame, or the
+        // capture is stopped. Without a viewer pulling, wake when the next grab is allowed;
+        // without XInput 2, poll the pointer at 60 Hz.
+        let timeout = if dirty && !pulled {
+            Some(PUSH_INTERVAL.saturating_sub(last_grab.elapsed()))
+        } else if xi2 {
+            None
+        } else {
+            Some(Duration::from_millis(16))
         };
-        unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        let ts = timeout.map(|t| libc::timespec {
+            tv_sec: t.as_secs() as libc::time_t,
+            tv_nsec: t.subsec_nanos() as libc::c_long,
+        });
+        let mut pfd = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: waker.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        unsafe {
+            libc::ppoll(
+                pfd.as_mut_ptr(),
+                2,
+                ts.as_ref().map_or(std::ptr::null(), |t| t as *const _),
+                std::ptr::null(),
+            )
+        };
+        if pfd[1].revents != 0 {
+            waker.drain();
+        }
     }
+    store.clear_requester();
     let _ = conn.shm_detach(shmseg);
     let _ = conn.flush();
     Ok(())
+}
+
+fn bounds(rects: &[Rect]) -> Rect {
+    let x0 = rects.iter().map(|r| r.x).min().unwrap_or(0);
+    let y0 = rects.iter().map(|r| r.y).min().unwrap_or(0);
+    let x1 = rects.iter().map(|r| r.x + r.w).max().unwrap_or(0);
+    let y1 = rects.iter().map(|r| r.y + r.h).max().unwrap_or(0);
+    Rect::new(x0, y0, x1 - x0, y1 - y0)
 }
 
 pub struct X11Input {

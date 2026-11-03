@@ -14,6 +14,7 @@ use crate::clock;
 use crate::encode::{self, Codec, EncoderParams, VideoEncoder};
 use crate::frame::{Signal, WAKE_COMMAND, WAKE_STOP};
 use crate::input;
+use crate::nvenc::FrameOpts;
 use crate::pacer::Pacer;
 use crate::probe;
 use crate::protocol::{self as proto, ClientMsg, Input, ServerMsg};
@@ -360,6 +361,9 @@ async fn serve(
                             ClientMsg::Keyframe => {
                                 if last_keyframe_req.elapsed() > Duration::from_millis(500) {
                                     last_keyframe_req = Instant::now();
+                                    // The viewer dropped its decoder: nothing in flight will be
+                                    // acknowledged, so do not wait for it.
+                                    shared.pacer.lock().unwrap().forget_inflight();
                                     shared.send(Cmd::Keyframe);
                                 }
                             }
@@ -629,7 +633,17 @@ async fn start_probe(
 /// Re-encode the last image at a higher bitrate once the screen has been still this long, so
 /// text sharpens after scrolling or dragging stops.
 const REFINE_AFTER: Duration = Duration::from_millis(120);
-const REFINE_FRAMES: u8 = 2;
+const REFINE_FRAMES: u8 = 3;
+
+/// How much to lower the QP of refinement frame `n` (0-based), where the encoder allows it.
+pub fn refine_sharpen(n: u8) -> u8 {
+    let v: Vec<u8> = std::env::var("SKYLIGHT_SHARPEN")
+        .unwrap_or_else(|_| "4,8,8".into())
+        .split(',')
+        .filter_map(|x| x.parse().ok())
+        .collect();
+    v.get(n as usize).copied().unwrap_or(0)
+}
 
 struct Stats {
     since: Instant,
@@ -644,6 +658,9 @@ struct Stats {
     input_capture_us: u64,
     input_sent_us: u64,
     input_n: u32,
+    /// Frames the capture source delivered (counter value at the window's start, and the count).
+    frames_in_at_start: u64,
+    captured: u64,
 }
 
 impl Stats {
@@ -659,6 +676,8 @@ impl Stats {
             input_capture_us: 0,
             input_sent_us: 0,
             input_n: 0,
+            frames_in_at_start: 0,
+            captured: 0,
         }
     }
 }
@@ -678,6 +697,10 @@ fn encoder_loop(
 ) {
     let mut store = cap.store.clone();
     store.subscribe(&sh.sig);
+    let mut _pull = store.pull();
+    let mut last_request = Instant::now() - Duration::from_secs(1);
+    let mut last_request_seq = u64::MAX;
+    let mut pull_slot: Option<Instant> = None;
     let mut enc: Option<VideoEncoder> = None;
     let (mut last_seq, mut last_gen) = (0u64, u32::MAX);
     let mut frame_id = 0u32;
@@ -727,6 +750,7 @@ fn encoder_loop(
                     cap = c;
                     store = cap.store.clone();
                     store.subscribe(&sh.sig);
+                    _pull = store.pull();
                     enc = None;
                     last_seq = 0;
                     last_gen = u32::MAX;
@@ -771,18 +795,26 @@ fn encoder_loop(
             if let Some(b) = p.adjust(now_us)
                 && let Some(e) = &mut enc
             {
-                // On NVENC a change costs a keyframe, so only follow big moves, at most every 3 s.
-                // On a fast link the first one lands on the cap a few seconds in.
+                // Where a change costs a keyframe (FFmpeg's NVENC wrapper), only follow big moves,
+                // at most every 3 s. Elsewhere follow every move of more than a few percent.
                 let ratio = b.max(e.bitrate()) as f64 / b.min(e.bitrate()).max(1) as f64;
                 let rarely = last_rate_change.elapsed() >= Duration::from_secs(3) && ratio >= 1.5;
-                if !e.bitrate_change_is_keyframe() || rarely {
+                if (!e.bitrate_change_is_keyframe() && ratio > 1.04) || rarely {
                     e.set_bitrate(b);
                     last_rate_change = Instant::now();
                 }
             }
+            if p.stalled(now_us) {
+                // The viewer stopped acknowledging (a hidden tab, a decoder reset); whatever it
+                // missed is gone, so start over from a keyframe.
+                need_key = true;
+            }
         }
         if stats.since.elapsed() >= Duration::from_secs(1) {
+            let frames_in = store.lock().frames_in;
+            stats.captured = frames_in.saturating_sub(stats.frames_in_at_start);
             send_stats(&out, &sh, &mut stats, enc.as_ref(), now_us);
+            stats.frames_in_at_start = frames_in;
         }
 
         let (w, h, format, generation) = store.shape();
@@ -791,11 +823,14 @@ fn encoder_loop(
         }
         let seq = store.lock().seq;
         let new_content = seq != last_seq || generation != last_gen;
+        // Changes waiting at an on-demand source (X11): asked for below, once a frame may go.
+        let pending = !new_content && store.pending();
         let refine_due = cfg.refine
             && refine_left > 0
             && !new_content
+            && !pending
             && now.duration_since(last_content) >= REFINE_AFTER;
-        if !new_content && !need_key && !refine_due {
+        if !new_content && !pending && !need_key && !refine_due {
             if cfg.refine && refine_left > 0 {
                 timeout = REFINE_AFTER
                     .saturating_sub(now.duration_since(last_content))
@@ -805,7 +840,7 @@ fn encoder_loop(
         }
         let recent_input =
             now_us.saturating_sub(last_input_us.load(Ordering::Relaxed)) < INPUT_FAST_PATH_US;
-        let interval = if recent_input && new_content {
+        let interval = if recent_input && (new_content || pending) {
             Duration::ZERO
         } else {
             Duration::from_micros(1_000_000 / fps.max(1) as u64)
@@ -823,6 +858,21 @@ fn encoder_loop(
                 );
                 continue;
             }
+        }
+        if pending && !need_key {
+            // Grab now, so the frame is as fresh as possible; its arrival wakes this loop.
+            // One request per batch of changes (and again if it went unanswered).
+            if last_request_seq != seq
+                || now.duration_since(last_request) > Duration::from_millis(20)
+            {
+                store.request_frame();
+                last_request = now;
+                last_request_seq = seq;
+                // Pace from the request, not from when the grab lands.
+                pull_slot.get_or_insert(now);
+            }
+            timeout = Duration::from_millis(20);
+            continue;
         }
 
         if enc
@@ -880,7 +930,15 @@ fn encoder_loop(
             let _ = out.send(text(proto::json(&m)));
         }
 
-        let (buf, stride) = e.input();
+        let (buf, stride) = match e.input() {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::error!("encoder input: {err:#}");
+                enc = None;
+                timeout = Duration::from_millis(100);
+                continue;
+            }
+        };
         let r = store.sync_into(last_seq, last_gen, w, h, buf, stride);
         if r.size_mismatch {
             enc = None;
@@ -894,11 +952,20 @@ fn encoder_loop(
         // target, and costs almost nothing when it is already there.
         let refine = r.damage.is_empty() && !need_key;
         let t0 = Instant::now();
-        // Pace from the start of each encode, so the cap is a real cap and not cap + encode time.
-        last_encode = t0;
+        // Pace from the start of each encode (or the grab request that led to it), so the cap is
+        // a real cap and not cap + encode time.
+        last_encode = pull_slot.take().unwrap_or(t0);
         let queue_us = clock::now_us().saturating_sub(r.capture_us);
         payload.clear();
-        let key = match e.encode(need_key, &mut payload) {
+        let opts = FrameOpts {
+            keyframe: need_key,
+            sharpen: if refine {
+                refine_sharpen(REFINE_FRAMES - refine_left)
+            } else {
+                0
+            },
+        };
+        let key = match e.encode_with(opts, &mut payload) {
             Ok(k) => k,
             Err(err) => {
                 tracing::error!("encode failed: {err:#}");
@@ -978,9 +1045,11 @@ fn send_stats(
     let content = (s.frames - s.refines).max(1) as f64;
     let (dec_sum, dec_n) = std::mem::take(&mut *sh.decode_us.lock().unwrap());
     let p = sh.pacer.lock().unwrap();
+    let frames_in_at_start = s.frames_in_at_start;
     let v = serde_json::json!({
         "t": "stats",
         "fps": s.frames as f64 / secs,
+        "captureFps": s.captured as f64 / secs,
         "refines": s.refines,
         "kbps": s.bytes as f64 * 8.0 / secs / 1000.0,
         "targetKbps": p.target_bps / 1000,
@@ -994,12 +1063,14 @@ fn send_stats(
         "minRttMs": p.min_rtt_us as f64 / 1000.0,
         "inflight": p.inflight(),
         "skipped": p.skipped,
+        "stalls": p.stalls,
         "decodeMs": if dec_n > 0 { dec_sum as f64 / dec_n as f64 / 1000.0 } else { 0.0 },
         "encoder": enc.map(|e| e.name.as_str()).unwrap_or(""),
     });
     drop(p);
     let _ = out.send(text(v.to_string()));
     *s = Stats::new();
+    s.frames_in_at_start = frames_in_at_start;
 }
 
 #[cfg(test)]

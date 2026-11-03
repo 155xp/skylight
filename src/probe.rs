@@ -198,7 +198,11 @@ pub fn run(x: i32, y: i32, size: u16, mode: Mode) -> Result<()> {
                     let line: Vec<u8> = (0..(size as usize / 10))
                         .map(|c| {
                             let h = (i as usize).wrapping_mul(2654435761) ^ c.wrapping_mul(40503);
-                            if (h >> 7) % 6 == 0 { b' ' } else { b'!' + ((h >> 3) % 90) as u8 }
+                            if (h >> 7).is_multiple_of(6) {
+                                b' '
+                            } else {
+                                b'!' + ((h >> 3) % 90) as u8
+                            }
                         })
                         .collect();
                     conn.image_text8(win, gc, 2, row, &line)?;
@@ -258,8 +262,13 @@ pub fn run(x: i32, y: i32, size: u16, mode: Mode) -> Result<()> {
         if debug {
             let t = start_debug.elapsed().as_millis();
             match &event {
-                Event::ButtonPress(e) => eprintln!("{t} press b{} at {},{} state {:?}", e.detail, e.event_x, e.event_y, e.state),
-                Event::ButtonRelease(e) => eprintln!("{t} release b{} at {},{}", e.detail, e.event_x, e.event_y),
+                Event::ButtonPress(e) => eprintln!(
+                    "{t} press b{} at {},{} state {:?}",
+                    e.detail, e.event_x, e.event_y, e.state
+                ),
+                Event::ButtonRelease(e) => {
+                    eprintln!("{t} release b{} at {},{}", e.detail, e.event_x, e.event_y)
+                }
                 Event::EnterNotify(e) => eprintln!("{t} enter mode {:?}", e.mode),
                 Event::LeaveNotify(e) => eprintln!("{t} leave mode {:?}", e.mode),
                 Event::FocusIn(e) => eprintln!("{t} focus-in {:?}", e.mode),

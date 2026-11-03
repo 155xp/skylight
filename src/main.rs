@@ -4,6 +4,9 @@ mod clock;
 mod encode;
 mod frame;
 mod input;
+mod nvenc;
+#[rustfmt::skip]
+mod nvenc_sys;
 mod pacer;
 mod probe;
 mod protocol;

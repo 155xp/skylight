@@ -6,6 +6,7 @@
 //! few kilobytes of memcpy instead of a full frame.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
@@ -139,6 +140,20 @@ pub struct StoreState {
 pub struct FrameStore {
     state: Mutex<StoreState>,
     subscribers: Mutex<Vec<Weak<Signal>>>,
+    /// Sources that grab on demand (X11): how to ask for a grab, whether changes are waiting to
+    /// be grabbed, and how many consumers pull frames rather than wait for them.
+    requester: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    pending: AtomicBool,
+    pullers: AtomicUsize,
+}
+
+/// Held by a consumer that asks for frames with [`FrameStore::request_frame`].
+pub struct PullGuard(Arc<FrameStore>);
+
+impl Drop for PullGuard {
+    fn drop(&mut self) {
+        self.0.pullers.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// What a consumer got from [`FrameStore::sync_into`].
@@ -173,7 +188,53 @@ impl FrameStore {
                 frames_in: 0,
             }),
             subscribers: Mutex::new(Vec::new()),
+            requester: Mutex::new(None),
+            pending: AtomicBool::new(false),
+            pullers: AtomicUsize::new(0),
         })
+    }
+
+    /// Become a consumer that pulls: from now on an on-demand source grabs only when asked.
+    pub fn pull(self: &Arc<Self>) -> PullGuard {
+        self.pullers.fetch_add(1, Ordering::Relaxed);
+        PullGuard(self.clone())
+    }
+
+    /// Whether any consumer pulls frames.
+    pub fn pulled(&self) -> bool {
+        self.pullers.load(Ordering::Relaxed) > 0
+    }
+
+    /// For on-demand sources: how a consumer asks for a grab.
+    pub fn set_requester(&self, f: Box<dyn Fn() + Send + Sync>) {
+        *self.requester.lock().unwrap() = Some(f);
+    }
+
+    pub fn clear_requester(&self) {
+        *self.requester.lock().unwrap() = None;
+    }
+
+    /// The source has changes it has not grabbed yet; consumers are woken to ask for them.
+    pub fn mark_pending(&self) {
+        if !self.pending.swap(true, Ordering::Relaxed) {
+            self.notify(WAKE_FRAME);
+        }
+    }
+
+    pub fn clear_pending(&self) {
+        self.pending.store(false, Ordering::Relaxed);
+    }
+
+    /// Changes are waiting at the source; `request_frame` brings them in.
+    pub fn pending(&self) -> bool {
+        self.pending.load(Ordering::Relaxed)
+    }
+
+    /// Ask an on-demand source to grab its pending changes now.
+    pub fn request_frame(&self) {
+        if let Some(f) = &*self.requester.lock().unwrap() {
+            f();
+        }
     }
 
     pub fn subscribe(&self, s: &Arc<Signal>) {
@@ -252,6 +313,7 @@ impl FrameStore {
             st.compositor_delay_us = compositor_delay_us;
             st.frames_in += 1;
         }
+        self.pending.store(false, Ordering::Relaxed);
         self.notify(WAKE_FRAME);
     }
 

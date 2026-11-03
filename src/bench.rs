@@ -77,7 +77,7 @@ pub fn run(
     let start = Instant::now();
     let mut first_key_bytes = 0;
     while start.elapsed() < Duration::from_secs(seconds) {
-        let (buf, stride) = enc.input();
+        let (buf, stride) = enc.input()?;
         let r = cap.store.sync_into(last_seq, last_gen, w, h, buf, stride);
         if r.size_mismatch {
             bail!("the source changed size during the benchmark");
@@ -137,10 +137,10 @@ pub fn run(
     }
     drop(enc);
 
-    // Still-image quality: one frame at the normal budget, then the two refinement frames.
+    // Still-image quality.
     let mut enc = VideoEncoder::open(&params)?;
     let mut img = vec![0u8; w as usize * h as usize * 4];
-    let (buf, stride) = enc.input();
+    let (buf, stride) = enc.input()?;
     let r = cap.store.sync_into(0, u32::MAX, w, h, buf, stride);
     if r.size_mismatch {
         return Ok(());
@@ -152,12 +152,45 @@ pub fn run(
     let mut dec = Decoder::new(codec, w, h)?;
     let mut stream = Vec::new();
     let mut report = Vec::new();
-    for (i, label) in ["first frame", "refine 1", "refine 2"].iter().enumerate() {
-        if i > 0 {
-            // Refinements re-encode the same image, as the session does once the screen is still.
-        }
+    // A keyframe of the image (what a new viewer gets), then the case refinement is for: the
+    // image arriving as one big change on top of a black screen, squeezed under the frame cap,
+    // followed by the refinement frames the session sends once the screen is still.
+    stream.clear();
+    enc.encode(true, &mut stream)?;
+    let psnr = dec.decode_psnr(&stream, &img, format == crate::frame::PixelFormat::Bgrx)?;
+    report.push(format!(
+        "keyframe {psnr:.1} dB ({:.1} kB)",
+        stream.len() as f64 / 1000.0
+    ));
+    drop(enc);
+    let mut enc = VideoEncoder::open(&params)?;
+    let mut dec = Decoder::new(codec, w, h)?;
+    enc.input()?.0.fill(0);
+    stream.clear();
+    enc.encode(true, &mut stream)?;
+    dec.decode_psnr(&stream, &img, true)?;
+    let (buf, stride) = enc.input()?;
+    for y in 0..h as usize {
+        buf[y * stride..y * stride + w as usize * 4]
+            .copy_from_slice(&img[y * w as usize * 4..(y + 1) * w as usize * 4]);
+    }
+    for (i, label) in ["change", "refine 1", "refine 2", "refine 3"]
+        .iter()
+        .enumerate()
+    {
         stream.clear();
-        enc.encode(i == 0, &mut stream)?;
+        let sharpen = if i == 0 {
+            0
+        } else {
+            crate::session::refine_sharpen(i as u8 - 1)
+        };
+        enc.encode_with(
+            crate::nvenc::FrameOpts {
+                keyframe: false,
+                sharpen,
+            },
+            &mut stream,
+        )?;
         let psnr = dec.decode_psnr(&stream, &img, format == crate::frame::PixelFormat::Bgrx)?;
         report.push(format!(
             "{label}: {:.1} dB ({:.1} kB)",

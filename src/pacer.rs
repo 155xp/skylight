@@ -3,12 +3,18 @@
 //! The browser acknowledges every frame as soon as it is decoded. That gives one round-trip
 //! sample per frame (network plus decode) without any clock sync. Two rules come out of it:
 //!
-//! * **Pacing.** If the oldest unacknowledged frame is older than the best round trip seen
-//!   recently plus a small allowance, the link is queueing. The encoder then skips frames
-//!   *before* encoding them (so no reference frame is ever lost) until acks catch up. On TCP this
-//!   is what keeps a slow link from building seconds of buffered video.
-//! * **Bitrate.** Every 250 ms the target moves: down hard when queueing appears (to below the
-//!   measured delivery rate), up gently while the link stays clear.
+//! * **Pacing.** A frame may only be encoded while the link is keeping up: the oldest
+//!   unacknowledged frame is younger than the best recent round trip plus a small allowance, and
+//!   no more frames are in flight than that round trip holds. Otherwise the encoder skips the frame
+//!   *before* encoding it (so no reference frame is ever lost) and takes the newest image once
+//!   acks catch up; damage accumulates meanwhile, so nothing is lost. On TCP this is what keeps a
+//!   slow link from building seconds of buffered video.
+//! * **Bitrate.** A delay-based controller: when queueing delay appears (round trips above the
+//!   recent minimum, or frames stuck in flight), the target drops below the rate the browser
+//!   actually acknowledged, and that rate is remembered as the path's ceiling for a while. While
+//!   the link is clear it climbs: fast at first, carefully near the ceiling, then probing gently
+//!   above it. It only climbs while the content uses the bitrate it has; a still screen says
+//!   nothing about the path.
 
 use std::collections::VecDeque;
 
@@ -22,6 +28,7 @@ pub struct Pacer {
     inflight: VecDeque<Sent>,
     rtt_samples: VecDeque<(u64, u64)>,
     acked: VecDeque<(u64, u32)>,
+    sent: VecDeque<(u64, u32)>,
     pub srtt_us: f64,
     pub min_rtt_us: u64,
     pub target_bps: u64,
@@ -29,14 +36,23 @@ pub struct Pacer {
     pub min_bps: u64,
     pub frame_interval_us: u64,
     last_adjust_us: u64,
+    last_cut_us: u64,
+    /// The acknowledged rate at the last congestion, and until when it is trusted.
+    ceiling: Option<(u64, u64)>,
+    slow_start: bool,
     blocked_since_us: Option<u64>,
     pub skipped: u64,
+    pub stalls: u64,
 }
 
 const RTT_WINDOW_US: u64 = 10_000_000;
 const RATE_WINDOW_US: u64 = 1_000_000;
-const ADJUST_EVERY_US: u64 = 250_000;
-const MAX_INFLIGHT: usize = 90;
+const ADJUST_EVERY_US: u64 = 200_000;
+const CUT_EVERY_US: u64 = 300_000;
+const CEILING_US: u64 = 15_000_000;
+/// A frame unacknowledged this long means the viewer stopped decoding (a hidden tab, a decoder
+/// reset); stop waiting for it.
+const STALL_US: u64 = 3_000_000;
 
 impl Pacer {
     pub fn new(start_bps: u64, min_bps: u64, max_bps: u64, fps: u32) -> Pacer {
@@ -44,6 +60,7 @@ impl Pacer {
             inflight: VecDeque::new(),
             rtt_samples: VecDeque::new(),
             acked: VecDeque::new(),
+            sent: VecDeque::new(),
             srtt_us: 0.0,
             min_rtt_us: 0,
             target_bps: start_bps.clamp(min_bps, max_bps),
@@ -51,8 +68,12 @@ impl Pacer {
             min_bps,
             frame_interval_us: 1_000_000 / fps.max(1) as u64,
             last_adjust_us: 0,
+            last_cut_us: 0,
+            ceiling: None,
+            slow_start: true,
             blocked_since_us: None,
             skipped: 0,
+            stalls: 0,
         }
     }
 
@@ -66,6 +87,8 @@ impl Pacer {
             bytes: bytes as u32,
             at_us: now_us,
         });
+        self.sent.push_back((now_us, bytes as u32));
+        trim(&mut self.sent, now_us, RATE_WINDOW_US);
     }
 
     /// Returns the round trip for `id`, if it was in flight.
@@ -89,23 +112,16 @@ impl Pacer {
                 self.srtt_us * 0.875 + r as f64 * 0.125
             };
             self.rtt_samples.push_back((now_us, r));
-            while self
-                .rtt_samples
-                .front()
-                .is_some_and(|(t, _)| t + RTT_WINDOW_US < now_us)
-            {
-                self.rtt_samples.pop_front();
-            }
+            trim(&mut self.rtt_samples, now_us, RTT_WINDOW_US);
             self.min_rtt_us = self.rtt_samples.iter().map(|(_, r)| *r).min().unwrap_or(r);
         }
-        while self
-            .acked
-            .front()
-            .is_some_and(|(t, _)| t + RATE_WINDOW_US < now_us)
-        {
-            self.acked.pop_front();
-        }
+        trim(&mut self.acked, now_us, RATE_WINDOW_US);
         rtt
+    }
+
+    /// The viewer dropped whatever it had (a decoder reset); nothing in flight will be acked.
+    pub fn forget_inflight(&mut self) {
+        self.inflight.clear();
     }
 
     fn allowance_us(&self) -> u64 {
@@ -117,12 +133,18 @@ impl Pacer {
         base + (2 * self.frame_interval_us).max(25_000).max(base / 2)
     }
 
+    /// How many frames the path holds: one round trip plus some slack, in frames.
+    fn window(&self) -> usize {
+        let frames = (self.min_rtt_us + 40_000) / self.frame_interval_us.max(1) + 2;
+        frames.clamp(3, 40) as usize
+    }
+
     /// May the next frame be encoded now?
     pub fn can_send(&mut self, now_us: u64) -> bool {
         let ok = match self.inflight.front() {
             None => true,
             Some(oldest) => {
-                self.inflight.len() < MAX_INFLIGHT
+                self.inflight.len() < self.window()
                     && now_us.saturating_sub(oldest.at_us) <= self.allowance_us()
             }
         };
@@ -135,21 +157,35 @@ impl Pacer {
         ok
     }
 
+    /// True (once) when the viewer has stopped acknowledging altogether. The window is cleared so
+    /// the stream can resume; the caller should send a keyframe, since frames were lost.
+    pub fn stalled(&mut self, now_us: u64) -> bool {
+        let stuck = self
+            .inflight
+            .front()
+            .is_some_and(|f| now_us.saturating_sub(f.at_us) > STALL_US);
+        if stuck {
+            self.inflight.clear();
+            self.blocked_since_us = None;
+            self.stalls += 1;
+        }
+        stuck
+    }
+
     /// When the oldest frame in flight will exceed the allowance (to time the next check).
     pub fn wait_hint_us(&self, now_us: u64) -> Option<u64> {
         let oldest = self.inflight.front()?;
         Some((oldest.at_us + self.allowance_us()).saturating_sub(now_us))
     }
 
-    /// Bytes per second acknowledged over the last second.
+    /// Bits per second acknowledged over the last second.
     pub fn delivery_bps(&self, now_us: u64) -> u64 {
-        let bytes: u64 = self
-            .acked
-            .iter()
-            .filter(|(t, _)| t + RATE_WINDOW_US >= now_us)
-            .map(|(_, b)| *b as u64)
-            .sum();
-        bytes * 8
+        rate(&self.acked, now_us)
+    }
+
+    /// Bits per second the encoder produced over the last second.
+    pub fn sent_bps(&self, now_us: u64) -> u64 {
+        rate(&self.sent, now_us)
     }
 
     /// Move the bitrate target; returns the new target when it changed.
@@ -157,25 +193,45 @@ impl Pacer {
         if now_us < self.last_adjust_us + ADJUST_EVERY_US {
             return None;
         }
+        let since = now_us - self.last_adjust_us;
         self.last_adjust_us = now_us;
+        if self.ceiling.is_some_and(|(_, until)| now_us > until) {
+            self.ceiling = None;
+        }
         let queue_us = (self.srtt_us as u64).saturating_sub(self.min_rtt_us);
         // Relays and Wi-Fi jitter by tens of ms without any real queue; scale the thresholds
         // with the base round trip so a 50 ms tunnel is not mistaken for congestion.
-        let high = 40_000.max(self.min_rtt_us / 2);
-        let low = 15_000.max(self.min_rtt_us / 4);
+        let high = 30_000.max(self.min_rtt_us / 2);
+        let low = 12_000.max(self.min_rtt_us / 4);
         let blocked = self
             .blocked_since_us
             .is_some_and(|t| now_us.saturating_sub(t) > 150_000);
         let old = self.target_bps;
         if blocked || queue_us > high {
-            let delivered = self.delivery_bps(now_us);
-            let mut next = self.target_bps * 3 / 4;
-            if delivered > 0 {
-                next = next.min(delivered * 85 / 100);
+            if now_us >= self.last_cut_us + CUT_EVERY_US {
+                self.last_cut_us = now_us;
+                self.slow_start = false;
+                let delivered = self.delivery_bps(now_us);
+                let mut next = self.target_bps * 85 / 100;
+                // A delivered rate well under the target may just be light content; only a
+                // rate near the target says something about the path.
+                if delivered >= self.target_bps / 2 {
+                    next = next.min(delivered * 85 / 100);
+                    self.ceiling = Some((delivered, now_us + CEILING_US));
+                }
+                self.target_bps = next.max(self.min_bps);
             }
-            self.target_bps = next.max(self.min_bps);
-        } else if queue_us < low && self.srtt_us > 0.0 {
-            self.target_bps = (self.target_bps * 115 / 100).min(self.max_bps);
+        } else if queue_us < low
+            && self.srtt_us > 0.0
+            && self.sent_bps(now_us) * 2 >= self.target_bps
+        {
+            let t = self.target_bps;
+            self.target_bps = match self.ceiling {
+                _ if self.slow_start => t * 3 / 2,
+                Some((c, _)) if t >= c * 9 / 10 => t + t * 2 / 100 * since / 1_000_000,
+                _ => t * 106 / 100 + 100_000,
+            }
+            .min(self.max_bps);
         }
         (self.target_bps != old).then_some(self.target_bps)
     }
@@ -184,6 +240,21 @@ impl Pacer {
         self.max_bps = max_bps.max(self.min_bps);
         self.target_bps = self.target_bps.min(self.max_bps);
     }
+}
+
+fn trim(q: &mut VecDeque<(u64, impl Copy)>, now_us: u64, window_us: u64) {
+    while q.front().is_some_and(|(t, _)| t + window_us < now_us) {
+        q.pop_front();
+    }
+}
+
+fn rate(q: &VecDeque<(u64, u32)>, now_us: u64) -> u64 {
+    let bytes: u64 = q
+        .iter()
+        .filter(|(t, _)| t + RATE_WINDOW_US >= now_us)
+        .map(|(_, b)| *b as u64)
+        .sum();
+    bytes * 8
 }
 
 #[cfg(test)]
@@ -222,9 +293,9 @@ mod tests {
     fn bitrate_drops_on_queueing_and_recovers() {
         let mut p = Pacer::new(20_000_000, 1_000_000, 40_000_000, 60);
         let mut t = 0;
-        // Clear link: 5 ms round trips, target climbs.
+        // Clear link, content that uses the bitrate (40 kB per 16 ms is 20 Mbit/s): it climbs.
         for id in 0..40 {
-            p.on_send(id, 20_000, t);
+            p.on_send(id, 40_000, t);
             p.on_ack(id, t + 5_000);
             t += 16_000;
             p.adjust(t);
@@ -233,7 +304,7 @@ mod tests {
         let high = p.target_bps;
         // Queueing: round trips grow to 200 ms.
         for id in 40..80 {
-            p.on_send(id, 20_000, t);
+            p.on_send(id, 40_000, t);
             p.on_ack(id, t + 200_000);
             t += 16_000;
             p.adjust(t);
@@ -245,6 +316,55 @@ mod tests {
             high
         );
         assert!(p.target_bps >= p.min_bps);
+        // The rate that got through is remembered: recovery approaches it carefully.
+        let ceiling = p.ceiling.expect("a ceiling after congestion").0;
+        for id in 80..200 {
+            p.on_send(id, 40_000, t);
+            p.on_ack(id, t + 5_000);
+            t += 16_000;
+            p.adjust(t);
+        }
+        assert!(
+            p.target_bps <= ceiling * 11 / 10,
+            "{} vs ceiling {ceiling}",
+            p.target_bps
+        );
+    }
+
+    #[test]
+    fn light_content_does_not_raise_the_target() {
+        // A blinking cursor says nothing about what the path could carry.
+        let mut p = Pacer::new(8_000_000, 1_000_000, 50_000_000, 60);
+        let mut t = 0;
+        for id in 0..300 {
+            p.on_send(id, 2_000, t);
+            p.on_ack(id, t + 5_000);
+            t += 16_000;
+            p.adjust(t);
+        }
+        assert_eq!(p.target_bps, 8_000_000);
+    }
+
+    #[test]
+    fn window_holds_one_round_trip_of_frames() {
+        let mut p = Pacer::new(10_000_000, 1_000_000, 50_000_000, 100);
+        p.on_send(0, 1000, 0);
+        p.on_ack(0, 2_000); // 2 ms round trip: (2 + 40) / 10 + 2 = 6 frames
+        for id in 1..=6 {
+            assert!(p.can_send(id as u64 * 1_000), "frame {id}");
+            p.on_send(id, 1000, id as u64 * 1_000);
+        }
+        assert!(!p.can_send(7_000));
+    }
+
+    #[test]
+    fn a_viewer_that_stops_acking_is_not_waited_for_forever() {
+        let mut p = Pacer::new(10_000_000, 1_000_000, 50_000_000, 60);
+        p.on_send(1, 1000, 0);
+        assert!(!p.stalled(1_000_000));
+        assert!(!p.can_send(1_000_000));
+        assert!(p.stalled(STALL_US + 1));
+        assert!(p.can_send(STALL_US + 2));
     }
 
     #[test]

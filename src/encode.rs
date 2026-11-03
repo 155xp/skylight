@@ -1,4 +1,5 @@
-//! Video encoding through libavcodec: NVENC first (H.264, HEVC or AV1), then VAAPI, then x264.
+//! Video encoding: NVENC first (H.264, HEVC or AV1; driven directly, see `nvenc.rs`, with
+//! FFmpeg's NVENC wrapper as a fallback), then VAAPI, then x264, through libavcodec.
 //!
 //! Every encoder is set up the same way for interactive use: no B-frames, no lookahead, no
 //! scene-cut keyframes, an effectively infinite GOP (keyframes only on request), CBR with a
@@ -12,6 +13,7 @@ use ffmpeg_sys_next as ff;
 use serde::{Deserialize, Serialize};
 
 use crate::frame::PixelFormat;
+use crate::nvenc::{FrameOpts, NvEncoder};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 #[serde(rename_all = "lowercase")]
@@ -90,6 +92,9 @@ impl Default for EncoderParams {
 }
 
 pub struct VideoEncoder {
+    /// Set when NVENC is driven directly; the FFmpeg fields below are then unused.
+    nv: Option<NvEncoder>,
+    nv_dynamic: bool,
     ctx: *mut ff::AVCodecContext,
     /// Packed RGB input the caller writes into.
     src: *mut ff::AVFrame,
@@ -125,7 +130,14 @@ fn set_opt(ctx: *mut ff::AVCodecContext, key: &str, val: &str) {
     let k = CString::new(key).unwrap();
     let v = CString::new(val).unwrap();
     // Unknown options are skipped on purpose: ffmpeg builds differ in what each encoder exposes.
-    let r = unsafe { ff::av_opt_set(ctx as *mut _, k.as_ptr(), v.as_ptr(), ff::AV_OPT_SEARCH_CHILDREN) };
+    let r = unsafe {
+        ff::av_opt_set(
+            ctx as *mut _,
+            k.as_ptr(),
+            v.as_ptr(),
+            ff::AV_OPT_SEARCH_CHILDREN,
+        )
+    };
     if r < 0 {
         tracing::debug!("encoder option {key}={val} not applied: {}", averr(r));
     }
@@ -149,8 +161,11 @@ pub fn init_logging(verbose: bool) {
     }
 }
 
-/// Names of the encoders to try for a codec and backend, best first.
+/// Names of the encoders to try for a codec and backend, best first. `nvenc` is the direct
+/// driver path; set SKYLIGHT_NVENC_DIRECT=0 to use FFmpeg's wrapper instead.
 fn candidates(codec: Codec, backend: Backend) -> Vec<&'static str> {
+    let direct = std::env::var("SKYLIGHT_NVENC_DIRECT").map_or(true, |v| v != "0");
+    let nv_direct: &[&'static str] = if direct { &["nvenc"] } else { &[] };
     let nv = match codec {
         Codec::H264 => "h264_nvenc",
         Codec::Hevc => "hevc_nvenc",
@@ -167,10 +182,10 @@ fn candidates(codec: Codec, backend: Backend) -> Vec<&'static str> {
         Codec::Av1 => &["libsvtav1"],
     };
     match backend {
-        Backend::Nvenc => vec![nv],
+        Backend::Nvenc => [nv_direct, &[nv]].concat(),
         Backend::Vaapi => vec![va],
         Backend::Software => sw.to_vec(),
-        Backend::Auto => [&[nv, va][..], sw].concat(),
+        Backend::Auto => [nv_direct, &[nv, va][..], sw].concat(),
     }
 }
 
@@ -191,6 +206,35 @@ impl VideoEncoder {
         if p.width < 16 || p.height < 16 || p.width > 8192 || p.height > 8192 {
             bail!("unsupported size {}x{}", p.width, p.height);
         }
+        if name == "nvenc" {
+            let nv = NvEncoder::open(p)?;
+            let nv_dynamic = nv.dynamic_bitrate();
+            return Ok(VideoEncoder {
+                nv: Some(nv),
+                nv_dynamic,
+                ctx: ptr::null_mut(),
+                src: ptr::null_mut(),
+                conv: ptr::null_mut(),
+                hw: ptr::null_mut(),
+                sws: ptr::null_mut(),
+                hw_device: ptr::null_mut(),
+                pkt: ptr::null_mut(),
+                pts: 0,
+                name: match p.codec {
+                    Codec::H264 => "nvenc-h264",
+                    Codec::Hevc => "nvenc-hevc",
+                    Codec::Av1 => "nvenc-av1",
+                }
+                .into(),
+                hardware: true,
+                codec: p.codec,
+                width: p.width,
+                height: p.height,
+                fps: p.fps.max(1),
+                bitrate: p.bitrate,
+                vbv_ms: p.vbv_ms.max(1),
+            });
+        }
         let cname = CString::new(name).unwrap();
         let codec = unsafe { ff::avcodec_find_encoder_by_name(cname.as_ptr()) };
         if codec.is_null() {
@@ -200,6 +244,8 @@ impl VideoEncoder {
         let vaapi = name.ends_with("_vaapi");
         let hardware = nvenc || vaapi;
         let mut enc = VideoEncoder {
+            nv: None,
+            nv_dynamic: false,
             ctx: ptr::null_mut(),
             src: ptr::null_mut(),
             conv: ptr::null_mut(),
@@ -400,35 +446,64 @@ impl VideoEncoder {
     /// so callers should change it rarely there.
     pub fn set_bitrate(&mut self, bitrate: u64) {
         let bitrate = bitrate.clamp(250_000, 400_000_000);
+        if let Some(nv) = &mut self.nv {
+            if let Err(e) = nv.set_bitrate(bitrate) {
+                tracing::warn!("NVENC bitrate change failed: {e:#}");
+            }
+            self.bitrate = nv.bitrate();
+            return;
+        }
         if bitrate != self.bitrate {
             unsafe { self.apply_rate(bitrate) };
         }
     }
 
     pub fn bitrate_change_is_keyframe(&self) -> bool {
-        self.name.ends_with("_nvenc")
+        match &self.nv {
+            Some(_) => !self.nv_dynamic,
+            None => self.name.ends_with("_nvenc"),
+        }
     }
 
     pub fn bitrate(&self) -> u64 {
         self.bitrate
     }
 
-    /// The packed-RGB frame the caller fills in, and its stride in bytes. Always writable.
-    pub fn input(&mut self) -> (&mut [u8], usize) {
+    /// The packed-RGB frame the caller fills in, and its stride in bytes. It keeps its contents
+    /// between frames, so only what changed needs writing.
+    pub fn input(&mut self) -> Result<(&mut [u8], usize)> {
+        if let Some(nv) = &mut self.nv {
+            return nv.input();
+        }
         unsafe {
             ff::av_frame_make_writable(self.src);
             let stride = (*self.src).linesize[0] as usize;
             let len = stride * self.height as usize;
-            (
+            Ok((
                 std::slice::from_raw_parts_mut((*self.src).data[0], len),
                 stride,
-            )
+            ))
         }
     }
 
     /// Encode the current input frame. Appends the bitstream (Annex B for H.264/HEVC, OBUs for
     /// AV1) to `out`.
     pub fn encode(&mut self, keyframe: bool, out: &mut Vec<u8>) -> Result<bool> {
+        self.encode_with(
+            FrameOpts {
+                keyframe,
+                ..Default::default()
+            },
+            out,
+        )
+    }
+
+    /// `encode` with per-frame options (honoured where the encoder supports them).
+    pub fn encode_with(&mut self, opts: FrameOpts, out: &mut Vec<u8>) -> Result<bool> {
+        if let Some(nv) = &mut self.nv {
+            return nv.encode(opts, out);
+        }
+        let keyframe = opts.keyframe;
         unsafe {
             let frame = if self.conv.is_null() {
                 self.src
@@ -509,6 +584,7 @@ unsafe fn alloc_frame(fmt: ff::AVPixelFormat, w: u32, h: u32) -> Result<*mut ff:
 
 impl Drop for VideoEncoder {
     fn drop(&mut self) {
+        self.nv = None;
         unsafe {
             if !self.ctx.is_null() {
                 ff::avcodec_free_context(&mut self.ctx);
@@ -554,7 +630,7 @@ mod tests {
 
     fn gradient(enc: &mut VideoEncoder, shift: u32) {
         let (w, h) = (enc.width, enc.height);
-        let (buf, stride) = enc.input();
+        let (buf, stride) = enc.input().unwrap();
         for y in 0..h {
             for x in 0..w {
                 let i = y as usize * stride + x as usize * 4;
@@ -617,7 +693,7 @@ mod nvenc {
     use super::*;
 
     /// Needs an NVIDIA GPU: `cargo test -- --ignored`. Documents why the session changes the
-    /// NVENC bitrate only rarely: FFmpeg turns every change into a keyframe.
+    /// bitrate only rarely on FFmpeg's NVENC wrapper (the fallback): every change is a keyframe.
     #[test]
     #[ignore]
     fn bitrate_change_sends_a_keyframe() {
@@ -627,12 +703,12 @@ mod nvenc {
             backend: Backend::Nvenc,
             ..Default::default()
         };
-        let mut enc = VideoEncoder::open(&p).unwrap();
+        let mut enc = VideoEncoder::open_named("h264_nvenc", &p).unwrap();
         assert!(enc.bitrate_change_is_keyframe());
         let mut out = Vec::new();
         let mut keys = Vec::new();
         for i in 0..6u32 {
-            let (buf, _) = enc.input();
+            let (buf, _) = enc.input().unwrap();
             buf.iter_mut()
                 .enumerate()
                 .for_each(|(j, b)| *b = ((j as u32 + i * 7) % 251) as u8);
@@ -643,5 +719,46 @@ mod nvenc {
             keys.push(enc.encode(i == 0, &mut out).unwrap());
         }
         assert_eq!(keys, [true, false, false, true, false, false]);
+    }
+
+    /// The direct NVENC path: bitrate changes in place (no keyframe), and the input buffer keeps
+    /// its pixels between frames, so the session only writes what changed.
+    #[test]
+    #[ignore]
+    fn direct_nvenc_keeps_input_and_changes_rate_in_place() {
+        let p = EncoderParams {
+            width: 640,
+            height: 360,
+            backend: Backend::Nvenc,
+            ..Default::default()
+        };
+        let mut enc = VideoEncoder::open_named("nvenc", &p).unwrap();
+        assert!(!enc.bitrate_change_is_keyframe());
+        let mut out = Vec::new();
+        let (buf, _) = enc.input().unwrap();
+        buf.iter_mut()
+            .enumerate()
+            .for_each(|(j, b)| *b = ((j * 7) % 251) as u8);
+        assert!(enc.encode(true, &mut out).unwrap());
+        assert_eq!(&out[..4], &[0, 0, 0, 1]);
+        let key = out.len();
+        let mut sizes = Vec::new();
+        for i in 0..6 {
+            if i == 3 {
+                enc.set_bitrate(enc.bitrate() / 2);
+            }
+            out.clear();
+            // Nothing written: the same image again must cost next to nothing.
+            let _ = enc.input().unwrap();
+            assert!(
+                !enc.encode(false, &mut out).unwrap(),
+                "frame {i} became a keyframe"
+            );
+            sizes.push(out.len());
+        }
+        assert!(
+            sizes.iter().all(|&s| s < key / 20),
+            "unchanged frames should be tiny (key {key}, then {sizes:?})"
+        );
     }
 }

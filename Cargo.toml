@@ -27,7 +27,7 @@ wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client", "unstable"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 wayland-scanner = "0.31.11"
-x11rb = { version = "0.14.0", features = ["shm", "damage", "xfixes", "xtest", "randr"] }
+x11rb = { version = "0.14.0", features = ["shm", "damage", "xfixes", "xtest", "randr", "xinput"] }
 
 [profile.release]
 strip = true

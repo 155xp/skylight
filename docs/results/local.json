@@ -1,0 +1,86 @@
+{
+  "base": "http://127.0.0.1:5490/",
+  "when": "2026-11-03T03:58:25.028Z",
+  "connectMs": 60,
+  "latency": {
+    "click": {
+      "mode": "click",
+      "samples": 50,
+      "failed": 0,
+      "decoded": {
+        "median": 18.299999997019768,
+        "p95": 23.5,
+        "min": 7.5,
+        "max": 26.200000002980232,
+        "mean": 17.13399999976158
+      },
+      "shown": {
+        "median": 25.3999999880798,
+        "p95": 35.69999998807907,
+        "min": 9.599999994039536,
+        "max": 37.8999999910593,
+        "mean": 24.98999999457602
+      }
+    },
+    "key": {
+      "mode": "key",
+      "samples": 50,
+      "failed": 0,
+      "decoded": {
+        "median": 20.5,
+        "p95": 32.80000001192093,
+        "min": 8.400000005960464,
+        "max": 36,
+        "mean": 19.664000000059605
+      },
+      "shown": {
+        "median": 29.499999988078343,
+        "p95": 41.199999991058576,
+        "min": 12.299999991060758,
+        "max": 51.599999999998545,
+        "mean": 29.241999993980063
+      }
+    },
+    "move": {
+      "mode": "move",
+      "samples": 50,
+      "failed": 0,
+      "decoded": {
+        "median": 27.400000005960464,
+        "p95": 33.70000000298023,
+        "min": 14.099999994039536,
+        "max": 40.5,
+        "mean": 24.87599999845028
+      },
+      "shown": {
+        "median": 32.99999998807834,
+        "p95": 44.99999999105785,
+        "min": 14.899999991059303,
+        "max": 46.89999999701831,
+        "mean": 33.001999993502835
+      }
+    }
+  },
+  "motion": {
+    "fps": 59.41,
+    "kbps": 5057.51,
+    "latencyMs": 15.09,
+    "latencyP95Ms": 22.74,
+    "serverMs": 7.96,
+    "queueMs": 5.34,
+    "encodeMs": 2.71,
+    "networkMs": 0.32,
+    "decodeMs": 1.79,
+    "displayMs": 5.04,
+    "jitterMs": 0.6,
+    "rttMs": 0.54,
+    "targetKbps": 50000,
+    "encoder": "h264_nvenc"
+  },
+  "width": 1920,
+  "height": 1080,
+  "codec": "avc1.64002a",
+  "refreshHz": 60,
+  "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
+  "hardwareConcurrency": 24
+}

@@ -1,0 +1,9 @@
+connected in 56 ms: 1920x1080 avc1.64002a, page refresh 60 Hz
+click input to decoded frame: median 10.1 ms, p95 17.2, min 5.4, max 19.2
+      input to displayed:     median 21.7 ms, p95 30.8, min 6.8, max 31.4  (30 samples, 0 lost)
+key   input to decoded frame: median 16.1 ms, p95 25.7, min 6.5, max 32.5
+      input to displayed:     median 23.8 ms, p95 37.2, min 10.8, max 41.9  (30 samples, 0 lost)
+move  input to decoded frame: median 10.5 ms, p95 19.3, min 5.0, max 25.9
+      input to displayed:     median 18.5 ms, p95 31.8, min 11.1, max 34.0  (30 samples, 0 lost)
+motion: 58 fps, 1.6 Mbit/s, capture to display 14.4 ms (p95 25.4)
+        server 8.1 ms (capture to encode 6.6, encode 2.8), network 0.4, decode 1.6, to display 2.4, rtt 0.7

@@ -1,0 +1,86 @@
+{
+  "base": "https://desk.example.com/",
+  "when": "2026-11-03T03:59:16.230Z",
+  "connectMs": 3816,
+  "latency": {
+    "click": {
+      "mode": "click",
+      "samples": 50,
+      "failed": 0,
+      "decoded": {
+        "median": 85.5,
+        "p95": 99.29999999701977,
+        "min": 67.70000000298023,
+        "max": 150.90000000596046,
+        "mean": 87.3919999998808
+      },
+      "shown": {
+        "median": 97.20000000298023,
+        "p95": 115.20000000298023,
+        "min": 69.70000000894106,
+        "max": 158.6000000059612,
+        "mean": 96.73600000619885
+      }
+    },
+    "key": {
+      "mode": "key",
+      "samples": 50,
+      "failed": 0,
+      "decoded": {
+        "median": 71.79999999701977,
+        "p95": 90.40000000596046,
+        "min": 49.79999999701977,
+        "max": 99.40000000596046,
+        "mean": 71.89799999982118
+      },
+      "shown": {
+        "median": 80.5000000029795,
+        "p95": 99.60000000298169,
+        "min": 55.500000002979505,
+        "max": 104.40000001191947,
+        "mean": 80.16800000584131
+      }
+    },
+    "move": {
+      "mode": "move",
+      "samples": 50,
+      "failed": 0,
+      "decoded": {
+        "median": 67.8999999910593,
+        "p95": 81.70000000298023,
+        "min": 55.70000000298023,
+        "max": 93.5,
+        "mean": 69.4440000012517
+      },
+      "shown": {
+        "median": 76.50000000595901,
+        "p95": 88.90000001191947,
+        "min": 60.00000000595901,
+        "max": 102.30000000893779,
+        "mean": 77.93000000673506
+      }
+    }
+  },
+  "motion": {
+    "fps": 56.93,
+    "kbps": 1038.69,
+    "latencyMs": 44.05,
+    "latencyP95Ms": 67.12,
+    "serverMs": 7.94,
+    "queueMs": 5.42,
+    "encodeMs": 2.72,
+    "networkMs": 30.14,
+    "decodeMs": 1.11,
+    "displayMs": 1.93,
+    "jitterMs": 10.99,
+    "rttMs": 47.17,
+    "targetKbps": 3550.3,
+    "encoder": "h264_nvenc"
+  },
+  "width": 1920,
+  "height": 1080,
+  "codec": "avc1.64002a",
+  "refreshHz": 60,
+  "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
+  "hardwareConcurrency": 24
+}

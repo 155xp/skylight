@@ -1,0 +1,10 @@
+page load failed (page.goto: net::ERR_CONNECTION_RESET at https://desk.example.com/#ticket=<redacted>&stats), retrying
+connected in 3816 ms: 1920x1080 avc1.64002a, page refresh 60 Hz
+click input to decoded frame: median 85.5 ms, p95 99.3, min 67.7, max 150.9
+      input to displayed:     median 97.2 ms, p95 115.2, min 69.7, max 158.6  (50 samples, 0 lost)
+key   input to decoded frame: median 71.8 ms, p95 90.4, min 49.8, max 99.4
+      input to displayed:     median 80.5 ms, p95 99.6, min 55.5, max 104.4  (50 samples, 0 lost)
+move  input to decoded frame: median 67.9 ms, p95 81.7, min 55.7, max 93.5
+      input to displayed:     median 76.5 ms, p95 88.9, min 60.0, max 102.3  (50 samples, 0 lost)
+motion: 57 fps, 1.0 Mbit/s, capture to display 44.0 ms (p95 67.1)
+        server 7.9 ms (capture to encode 5.4, encode 2.7), network 30.1, decode 1.1, to display 1.9, rtt 47.2

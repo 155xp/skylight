@@ -1,0 +1,21 @@
+[Unit]
+Description=Skylight remote desktop (loopback only)
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# SKYLIGHT_TICKET_KEY, SKYLIGHT_AUDIENCE and SKYLIGHT_ALLOW_ORIGINS live here, outside the repo.
+EnvironmentFile=%h/.config/skylight/env
+ExecStart=@BIN@ serve
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=%t
+# /tmp stays shared: the latency probe reaches Xwayland through /tmp/.X11-unix.
+LockPersonality=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=graphical-session.target

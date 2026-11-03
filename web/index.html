@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Skylight</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="viewer.css">
+<script type="module" src="viewer.js"></script>
+</head>
+<body>
+<main id="screen" aria-label="Remote desktop"></main>
+
+<div id="bar" class="bar surface-overlay" role="toolbar" aria-label="Remote desktop controls">
+  <button class="icon" id="monitor" aria-label="Display" hidden>
+    <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+  </button>
+  <button class="icon" id="scale" aria-label="Fit to window">
+    <svg viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+  </button>
+  <button class="icon touch-only" id="keyboard" aria-label="Keyboard">
+    <svg viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M8 13h.01M12 13h.01M16 13h.01M7 16h10"/></svg>
+  </button>
+  <button class="icon touch-only" id="touchmode" aria-label="Touch mode: trackpad">
+    <svg viewBox="0 0 24 24"><path d="M4 4l7 16 2.5-6.5L20 11z"/></svg>
+  </button>
+  <button class="icon" id="statsbtn" aria-label="Stats" aria-pressed="false">
+    <svg viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+  </button>
+  <button class="icon" id="settingsbtn" aria-label="Settings" aria-expanded="false">
+    <svg viewBox="0 0 24 24"><path d="M20 7h-9M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></svg>
+  </button>
+  <button class="icon" id="fullscreen" aria-label="Full screen">
+    <svg viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+  </button>
+</div>
+
+<section id="stats" class="card surface-raised" hidden aria-live="off">
+  <div class="figure"><span id="s-latency">–</span><span class="unit">ms</span></div>
+  <p class="label">Capture to display</p>
+  <dl>
+    <dt>Frame rate</dt><dd id="s-fps">–</dd>
+    <dt>Bitrate</dt><dd id="s-kbps">–</dd>
+    <dt>Server</dt><dd id="s-server">–</dd>
+    <dt>Network</dt><dd id="s-network">–</dd>
+    <dt>Decode</dt><dd id="s-decode">–</dd>
+    <dt>Round trip</dt><dd id="s-rtt">–</dd>
+    <dt>Stream</dt><dd id="s-stream">–</dd>
+  </dl>
+</section>
+
+<section id="settings" class="card surface-overlay" hidden>
+  <h2>Settings</h2>
+  <div class="row mac-only">
+    <span>Cmd key sends</span>
+    <div class="seg" data-setting="cmdKey"><button data-v="ctrl">Ctrl</button><button data-v="super">Super</button></div>
+  </div>
+  <div class="row">
+    <span>Quality cap</span>
+    <div class="seg" data-setting="bitrate"><button data-v="0">Auto</button><button data-v="20">20</button><button data-v="8">8</button><button data-v="3">3</button></div>
+  </div>
+  <div class="row" id="codecrow">
+    <span>Codec</span>
+    <div class="seg" data-setting="codec"><button data-v="h264">H.264</button><button data-v="hevc">HEVC</button><button data-v="av1">AV1</button></div>
+  </div>
+  <div class="row" id="monitorrow" hidden>
+    <span>Display</span>
+    <div class="seg" id="monitors" data-setting="monitor"></div>
+  </div>
+  <div class="latency">
+    <div>
+      <p class="value" id="latency-result">Not measured</p>
+      <p class="desc" id="latency-desc">Moves, clicks and types into a probe window on the desktop</p>
+    </div>
+    <button class="secondary" id="measure">Measure</button>
+  </div>
+</section>
+
+<div id="status" class="status" hidden>
+  <p class="title" id="status-title">Connecting</p>
+  <p class="desc" id="status-desc"></p>
+  <button class="secondary" id="reconnect" hidden>Reconnect</button>
+</div>
+</body>
+</html>

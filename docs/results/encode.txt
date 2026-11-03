@@ -1,0 +1,17 @@
+source:  synthetic 1920x1080 (synthetic backend), encoder h264_nvenc at 50 Mbit/s, 144 fps cap
+frames:  719 in 5.0 s (143.8 fps of changed content)
+encode:  mean 3.29 ms, p50 3.38, p95 3.56, p99 3.72, max 5.44
+capture to encoded: p50 3.47 ms, p95 3.68 ms (includes waiting for the copy and the encode)
+size:    keyframe 280.6 kB, delta mean 2.6 kB, p95 3.6 kB, 3.0 Mbit/s
+still image PSNR (luma): first frame: 26.9 dB (283.1 kB), refine 1: 27.0 dB (0.2 kB), refine 2: 27.0 dB (0.1 kB)
+source:  synthetic 1920x1080 (synthetic backend), encoder libx264 at 50 Mbit/s, 144 fps cap
+frames:  719 in 5.0 s (143.8 fps of changed content)
+encode:  mean 3.59 ms, p50 3.54, p95 4.03, p99 6.48, max 8.89
+capture to encoded: p50 3.57 ms, p95 4.08 ms (includes waiting for the copy and the encode)
+size:    keyframe 274.1 kB, delta mean 3.0 kB, p95 3.3 kB, 3.4 Mbit/s
+still image PSNR (luma): first frame: 27.7 dB (274.9 kB), refine 1: 28.7 dB (12.1 kB), refine 2: 29.9 dB (26.4 kB)
+[2m2026-11-03T04:00:20.249921Z[0m [32m INFO[0m [2mskylight::capture::kde[0m[2m:[0m KWin screencast started [3mmonitor[0m[2m=[0mHDMI-A-1 [3mnode[0m[2m=[0m82
+[2m2026-11-03T04:00:20.257039Z[0m [32m INFO[0m [2mskylight::capture::pw[0m[2m:[0m PipeWire format [3mwidth[0m[2m=[0m1920 [3mheight[0m[2m=[0m1080 [3mformat[0m[2m=[0mVideoFormat::BGRA
+source:  HDMI-A-1 1920x1080 (kde backend), encoder h264_nvenc at 50 Mbit/s, 144 fps cap
+no frames changed during the run (an idle desktop sends nothing); move a window and retry
+still image PSNR (luma): first frame: 49.5 dB (71.3 kB), refine 1: 49.9 dB (6.4 kB), refine 2: 50.9 dB (7.5 kB)

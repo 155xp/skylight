@@ -1,0 +1,13 @@
+{
+  "name": "skylight-tools",
+  "private": true,
+  "type": "module",
+  "description": "Browser-side tests and the end-to-end latency benchmark (needs Chromium).",
+  "scripts": {
+    "test": "node --test clients/node/test/",
+    "bench": "node scripts/bench.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.56.0"
+  }
+}

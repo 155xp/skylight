@@ -1,0 +1,8 @@
+/target
+/node_modules
+# Keys and local settings never belong in the repo.
+*.pem
+*.key
+.env
+env
+ticket-private*

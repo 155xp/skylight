@@ -12,21 +12,24 @@ arrives. The cursor is drawn by the browser, so it never lags.
 
 ## Features
 
-- **Low latency:** about 25 ms from click to screen over loopback and under 100 ms through a
-  public TCP tunnel, at 57-59 fps under motion (measured below).
+- **Low latency:** about 7 ms from a click to the decoded frame over loopback on a test bed, under
+  100 ms through a public TCP tunnel, and a steady 60 fps under motion, from loopback down to a
+  10 Mbit/s link (measured below).
 - **Runs in any modern browser.** No plugin or app. Hardware decoding wherever the browser has it
   (WebCodecs, H.264 by default, HEVC and AV1 when both ends support them).
 - **KDE Plasma on Wayland** (KWin screencast, fake input, clipboard) and **X11** (MIT-SHM, XDamage,
   XTEST).
-- **NVENC, VAAPI or software encoding** (x264, x265, SVT-AV1), with damage tracking: an idle
-  screen sends nothing.
+- **NVENC driven directly**, or VAAPI or software encoding (x264, x265, SVT-AV1), with damage
+  tracking: an idle screen sends nothing and costs nothing.
 - **Built for Mac and iPhone clients:** keys by physical position, Cmd mapped to Ctrl, clipboard
   both ways, trackpad-style touch control and the iOS keyboard.
 - **No passwords.** Access is a short-lived Ed25519-signed ticket minted by an app you control.
   Skylight only listens on loopback and holds only public keys.
 - **Embeddable:** `web/skylight.js` is one dependency-free ES module you can drop into your own
   web app ([INTEGRATION.md](INTEGRATION.md)).
-- **Small:** one 4.7 MB binary, about 55 MB of memory idle.
+- **Small:** one 4.9 MB binary, about 55 MB of memory idle.
+- **Scriptable:** `/api/screenshot` and `/api/wait` let agents and tests see the screen and wait
+  for it to settle without polling.
 
 ## Requirements
 
@@ -153,6 +156,50 @@ a 60 Hz page. A client with hardware decoding and a 120 Hz screen should come in
 machine, so the relay is crossed twice. Every figure comes from `scripts/final-bench.sh` (raw
 output in [`docs/results/`](docs/results)), 50 samples per input type.
 
+### Test bed: before and after the speed work
+
+The numbers in this section come from a throwaway virtual X display (Xvfb, 1920×1080, X11
+backend) with a second server on its own port, NVENC on an RTX-class GPU, and headless Chromium on
+the same machine. Slower paths are emulated by `scripts/netem.mjs` (fixed delay, and a bottleneck
+with a deep queue). Everything is reproducible with `scripts/testbed.sh` and
+`scripts/link-bench.sh`. Medians of 50 samples per input type; "before" is the previous release
+measured the same way, in the same session.
+
+Input to decoded frame (ms), the browser's view of a click or key press on the remote desktop:
+
+| Path | Input | Median | p95 | To display (median) |
+|---|---|---|---|---|
+| Loopback | click | 9.9 → **6.7** | 17.7 → 7.3 | 19.4 → 17.0 |
+| | key | 11.9 → **6.9** | 23.6 → 8.0 | 20.6 → 14.3 |
+| | move | 10.6 → **7.8** | 22.5 → 8.7 | 21.4 → 17.2 |
+| 47 ms round trip | click | 59.4 → **55.7** | 68.9 → 56.6 | 69.0 → 62.7 |
+| | key | 61.9 → **56.8** | 73.8 → 57.9 | 70.4 → 64.8 |
+| 10 Mbit/s, 40 ms | click | 53.5 → **48.2** | 61.9 → 49.3 | 60.3 → 54.8 |
+| | key | 55.2 → **49.2** | 69.0 → 50.1 | 63.6 → 57.0 |
+| 5 Mbit/s, 60 ms | click | 73.3 → **68.2** | 80.8 → 69.5 | 84.3 → 77.2 |
+| | key | 77.0 → **68.8** | 97.1 → 70.1 | 86.8 → 76.6 |
+
+Glass to glass under motion: the animated probe stamps every redraw with the time, and the
+browser reads it back out of each decoded frame, so this is the time from the app drawing a frame
+to the browser having it, plus how many distinct frames arrive per second:
+
+| Path | Content | Median (ms) | p95 (ms) | Distinct frames/s | Mbit/s |
+|---|---|---|---|---|---|
+| Loopback | animation | 11.4 → **6.8** | 21.4 → **9.1** | 58.2 → **59.6** | 1.7 → 1.2 |
+| Loopback | scrolling text | 11.8 → **6.2** | 22.3 → **8.0** | 56.5 → **59.6** | 2.2 → 1.8 |
+| 47 ms round trip | animation | 37.9 → **30.1** | 48.3 → **32.9** | 58.4 → **59.6** | 0.5 → 1.2 |
+| 47 ms round trip | scrolling text | 34.0 → **31.2** | 47.0 → **33.6** | 56.1 → **59.7** | 1.6 → 1.7 |
+| 10 Mbit/s, 40 ms | scrolling text | 35.4 → **30.7** | 52.1 → **33.4** | 55.9 → **59.5** | 2.4 → 1.6 |
+| 5 Mbit/s, 60 ms | animation | 45.5 → **41.5** | 56.2 → **44.6** | 58.5 → **59.6** | 0.4 → 1.2 |
+| 5 Mbit/s, 60 ms | scrolling text | 208.3 → **43.4** | 240.3 → **119.4** | 21.5 → **50.1** | 3.9 → 2.1 |
+
+Server time per frame under motion (capture to encode start, plus encode) fell from 7.7 ms to
+2.9 ms. With a viewer connected to a still screen, the server uses 0.2% of a core (was 0.7%) and
+the GPU's encoder sits at 0%. With the page's own thread kept busy 25 ms out of every 50, motion
+latency to the decoded frame stays at 5.2 ms (15 ms when decoding on that thread, the old way).
+
+The rest of this section was measured with the previous release on a real KDE Plasma desktop.
+
 ### Input to photon
 
 | Path | Click to update | Key press to glyph | Pointer move to hover change |
@@ -214,23 +261,24 @@ the right is the viewer's stats):
 An idle desktop sends nothing at all: frames are produced only for damage, and only the changed
 pixels are copied.
 
-Encoder alone, 1080p, `skylight bench` ([`encode.txt`](docs/results/encode.txt)):
+Encoder alone, 1080p, `skylight bench` (current release):
 
 | Encoder | Mean | p95 | p99 |
 |---|---|---|---|
-| NVENC H.264, preset p2 | 3.29 ms | 3.56 ms | 3.72 ms |
+| NVENC H.264, driven directly, preset p2 | 1.87 ms | 1.92 ms | 1.95 ms |
+| NVENC H.264 through FFmpeg (fallback) | 3.33 ms | 3.47 ms | 3.53 ms |
 | x264 superfast, sliced threads (software fallback) | 3.59 ms | 4.03 ms | 6.48 ms |
 
-Both kept up with 144 fps of full-screen motion. On the real desktop at the 50 Mbit/s cap, a
-still image decodes at 49.5 dB luma PSNR on the first frame and 50.9 dB after two refinement
-frames (6 to 8 kB each). Those are re-encodes of the unchanged screen sent 120 ms after motion
-stops, so text sharpens right after you stop scrolling.
+Text after motion stops (a terminal page arriving as one big change at a 16 Mbit/s cap, then the
+refinement frames): 25.6 dB luma PSNR on the change, 36.3 dB after three refinement frames
+(FFmpeg's NVENC: 32.6 dB). A keyframe at that cap comes out at 47.8 dB (was 29.6 dB), because a
+forced keyframe gets four times the usual budget for that one frame.
 
 ### Footprint
 
 | | |
 |---|---|
-| Release binary | 4.69 MB stripped (`strip = true`), plus system FFmpeg and PipeWire |
+| Release binary | 4.9 MB stripped (`strip = true`), plus system FFmpeg and PipeWire |
 | Memory, idle | 55 MB RSS |
 | Memory, one viewer streaming | 241 MB RSS median, 255 MB peak |
 
@@ -240,29 +288,45 @@ and NVENC surfaces (`/dev/nvidiactl` and `/dev/zero` mappings). Skylight's own h
 
 ## What makes it fast
 
-- **Separate input socket, no batching.** Every pointer move, click and key is one tiny binary
-  message on `/input`, injected the moment it is read. `TCP_NODELAY` is on everywhere, and
+- **Separate input socket, injected in batches.** Every pointer move, click and key is one tiny
+  binary message on `/input`. Whatever has arrived is injected at once, with a backlog of pointer
+  moves collapsed to its last position, and flushed once. `TCP_NODELAY` is on everywhere, and
   Chrome's `pointerrawupdate` is used where available.
 - **Frames that answer input skip the queue.** For 250 ms after any input, a new frame is encoded
-  the instant KWin delivers it, ignoring the frame-rate cap.
+  the instant it exists, ignoring the frame-rate cap.
+- **NVENC without a middleman.** Skylight drives NVENC through NVIDIA's API directly. The session
+  writes the damaged rectangles straight into the encoder's own input buffer, so an unchanged
+  pixel is never copied twice (1080p encode: 1.9 ms instead of 3.4 ms through FFmpeg). Bitrate
+  changes reconfigure the encoder in place, without a keyframe. FFmpeg's NVENC wrapper, VAAPI and
+  x264 remain as fallbacks.
 - **Zero-latency encoding.** No B-frames, no lookahead, no scene-cut keyframes, an infinite GOP
-  (keyframes only on request), `tune=ull`, `zerolatency`, `delay=0`, and a VBV of 34 ms so no
-  single frame can stall the link. Rate control is VBR capped at the target: a frame that
-  changes a few pixels costs a few kilobytes, not a whole frame's budget.
-- **Damage tracking end to end.** KWin's damage rectangles decide what gets copied, and an idle
-  screen sends no frames.
-- **Decode on arrival.** `VideoDecoder` with `optimizeForLatency`, drawn the moment it outputs.
-  Each decoded frame is acknowledged.
-- **Pacing that never builds a queue.** If the oldest unacknowledged frame is older than the best
-  recent round trip plus a small allowance, the next frame is skipped before it is encoded (so
-  no reference is lost). Over TCP, that is what keeps a slow link from buffering seconds of video.
-- **Client-side cursor.** KWin hands the cursor over as metadata, never burned into the video.
-  The browser shows it as a CSS cursor with the real shape, so pointer motion has no network
-  latency at all. On a phone it is drawn as a sprite you steer like a trackpad.
-
-FFmpeg's NVENC wrapper resets the encoder and sends a keyframe on every bitrate change (checked
-by an ignored test, `cargo test -- --ignored`). So on NVENC the cap moves only on big, settled
-changes, at most every 3 seconds; x264 reconfigures in place.
+  (keyframes only on request), ultra-low-latency tuning, and a VBV of 34 ms so no single frame can
+  stall the link. Rate control is VBR capped at the target: a frame that changes a few pixels costs
+  a few kilobytes. A forced keyframe gets four times the usual budget for that one frame, so a new
+  viewer starts sharp.
+- **Capture on demand (X11).** XDamage only marks the screen as changed; the encoder asks for a
+  grab at the moment it is ready to encode, so a frame is about 1 ms old when encoding starts, and
+  only the band of rows that changed is read back. Pointer motion arrives as XInput 2 events, so a
+  still screen costs nothing. On KDE, KWin's damage rectangles decide what gets copied.
+- **Decode on arrival, off the page's thread.** The video socket, a `VideoDecoder` with
+  `optimizeForLatency` and an `OffscreenCanvas` live in a worker, so layout, charts or garbage
+  collection on the page never delay a frame. Each frame is drawn the moment it is decoded, the
+  newest one wins, and it is acknowledged right away.
+- **Pacing that never builds a queue.** At most one round trip's worth of frames is in flight, and
+  if the oldest unacknowledged frame is older than the best recent round trip plus a small
+  allowance, the next frame is skipped before it is encoded (so no reference is lost); the damage
+  carries over to the next one. Over TCP, that is what keeps a slow link from buffering seconds of
+  video. A viewer that stops acknowledging (a hidden tab) is not waited for.
+- **Delay-based bitrate.** When round trips rise above their recent minimum, the target drops
+  below what the browser actually acknowledged, and that rate is remembered as the path's
+  ceiling. While the link is clear the target climbs, fast at first, carefully near the ceiling,
+  and only while the content uses what it has.
+- **Sharp text after motion.** Once the screen has been still for 120 ms (and input has paused for
+  300 ms), up to three refinement frames re-encode the image with a lower QP, one at a time, each
+  after the previous frame was acknowledged.
+- **Client-side cursor.** The cursor travels as metadata, never burned into the video. The browser
+  shows it as a CSS cursor with the real shape, so pointer motion has no network latency at all.
+  On a phone it is drawn as a sprite you steer like a trackpad.
 
 ## Security and threat model
 
@@ -306,11 +370,27 @@ replace `~/.local/bin/skylight` (KWin trusts that path through the `.desktop` fi
 can write it already runs as that user). Bandwidth-exhaustion DoS through a tunnel is out of
 scope. The latency probe opens a window on the desktop, and only for an `input` session.
 
+## For programs: screenshots and waiting for the screen
+
+Agents and test scripts that drive the desktop can skip the "sleep two seconds and hope" step:
+
+```sh
+ticket() { skylight ticket --key ~/.config/skylight/ticket-private.pem --audience my-desktop --scope view; }
+curl -sH "Authorization: Bearer $(ticket)" http://127.0.0.1:5490/api/screenshot > screen.png
+curl -sH "Authorization: Bearer $(ticket)" "http://127.0.0.1:5490/api/wait?idle=300"        # settled
+curl -sH "Authorization: Bearer $(ticket)" "http://127.0.0.1:5490/api/wait?change&region=0,0,800,600"
+```
+
+`/api/wait` returns once the screen (or a region) has been still for `idle` ms, or with `change`,
+at the first change after a sequence number (`since`, from a screenshot's `X-Skylight-Seq`). It is
+answered from the capture's damage tracking, without screenshots or polling. Details in
+[docs/PROTOCOL.md](docs/PROTOCOL.md#http-apiscreenshot-and-apiwait).
+
 ## Benchmarks and tests
 
 ```sh
 cargo test                       # unit tests (tickets, pacing, framing, damage, encoder)
-cargo test -- --ignored          # also the NVENC keyframe-on-bitrate-change check (needs a GPU)
+cargo test -- --ignored          # also the NVENC checks (need a GPU)
 cargo clippy --all-targets
 pnpm install && pnpm test        # ticket interop between the Node minter and the Rust verifier
 skylight bench                   # encoder speed and still-image quality on this machine
@@ -319,11 +399,17 @@ node scripts/bench.mjs --base https://desk.example.com/   # the same through you
 ./scripts/final-bench.sh         # all of the above plus server RSS, into docs/results/
                                  # (set SKYLIGHT_PUBLIC_URL to include the public run)
 node scripts/screenshots.mjs     # the viewer screenshots in docs/results/
+
+scripts/testbed.sh start         # a second server on a virtual X display, with its own keys
+scripts/link-bench.sh out/       # against it: loopback, a 47 ms path, 10 and 5 Mbit/s links
+node scripts/netem.mjs --rtt 60 --mbps 5   # just the emulated link, in front of any server
 ```
 
 The browser scripts need Chromium at `/usr/bin/chromium` and the service's private key at
 `~/.config/skylight/ticket-private.pem` (or `--key`); tickets use the hostname as `aud` unless
-you pass `--aud`. [docs/PROTOCOL.md](docs/PROTOCOL.md) documents the wire format.
+you pass `--aud`. `bench.mjs --jank 25` keeps the page's thread busy 25 ms out of every 50, and
+`--no-worker` decodes on it, for comparing the two. [docs/PROTOCOL.md](docs/PROTOCOL.md)
+documents the wire format.
 
 ## Not done yet
 
@@ -336,6 +422,10 @@ you pass `--aud`. [docs/PROTOCOL.md](docs/PROTOCOL.md) documents the wire format
 - **Zero-copy capture.** Frames come over shared memory, so KWin reads them back from the GPU and
   Skylight uploads them again. DMA-BUF import into CUDA would save a few milliseconds of the 10.5
   ms KWin share and the copy.
+- **Recording** from the stream (`/api/record`) would need an MP4 muxer; not yet.
+- **Lossy links.** Everything runs over TCP, so on lossy Wi-Fi or mobile links a lost packet holds
+  up the frames behind it. A WebTransport path would avoid that; the pacing and rate control would
+  carry over unchanged.
 
 ## License
 

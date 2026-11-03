@@ -70,312 +70,335 @@ function percentile(a, p) {
   return s[Math.min(s.length - 1, Math.round((s.length - 1) * p))];
 }
 
-// --- Bitstream helpers ------------------------------------------------------------------------
-
-/** Split an Annex B access unit into NAL units (without start codes). */
-export function splitAnnexB(buf) {
-  const out = [];
-  let i = 0;
-  let start = -1;
-  const n = buf.length;
-  while (i + 2 < n) {
-    if (buf[i] === 0 && buf[i + 1] === 0 && (buf[i + 2] === 1 || (buf[i + 2] === 0 && i + 3 < n && buf[i + 3] === 1))) {
-      const sc = buf[i + 2] === 1 ? 3 : 4;
-      if (start >= 0) out.push(buf.subarray(start, i));
-      i += sc;
-      start = i;
-    } else {
-      i++;
-    }
-  }
-  if (start >= 0) out.push(buf.subarray(start));
-  return out;
-}
-
-function hex2(v) {
-  return v.toString(16).padStart(2, '0');
-}
-
-/** H.264: build the avcC record and the `avc1.PPCCLL` codec string from SPS and PPS. */
-export function avcConfig(sps, pps) {
-  const rec = new Uint8Array(11 + sps.length + pps.length + 4);
-  let o = 0;
-  rec[o++] = 1;
-  rec[o++] = sps[1];
-  rec[o++] = sps[2];
-  rec[o++] = sps[3];
-  rec[o++] = 0xff; // 4-byte NAL lengths
-  rec[o++] = 0xe1; // one SPS
-  rec[o++] = sps.length >> 8;
-  rec[o++] = sps.length & 0xff;
-  rec.set(sps, o);
-  o += sps.length;
-  rec[o++] = 1; // one PPS
-  rec[o++] = pps.length >> 8;
-  rec[o++] = pps.length & 0xff;
-  rec.set(pps, o);
-  o += pps.length;
-  // High-profile extension: 4:2:0, 8-bit, no SPS extensions.
-  rec[o++] = 0xfd;
-  rec[o++] = 0xf8;
-  rec[o++] = 0xf8;
-  rec[o++] = 0;
-  const high = [100, 110, 122, 244, 44, 83, 86, 118, 128].includes(sps[1]);
-  return {
-    codec: `avc1.${hex2(sps[1])}${hex2(sps[2])}${hex2(sps[3])}`,
-    description: high ? rec : rec.subarray(0, o - 4),
-  };
-}
-
-/** Annex B access unit to length-prefixed (AVCC) samples, dropping parameter sets and AUDs. */
-function toAvcc(nals) {
-  let len = 0;
-  const keep = nals.filter((n) => {
-    const t = n[0] & 0x1f;
-    return t !== 7 && t !== 8 && t !== 9;
-  });
-  for (const n of keep) len += 4 + n.length;
-  const out = new Uint8Array(len);
-  let o = 0;
-  for (const n of keep) {
-    out[o++] = n.length >>> 24;
-    out[o++] = (n.length >>> 16) & 0xff;
-    out[o++] = (n.length >>> 8) & 0xff;
-    out[o++] = n.length & 0xff;
-    out.set(n, o);
-    o += n.length;
-  }
-  return out;
-}
-
-function bytesEqual(a, b) {
-  if (!a || !b || a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
-}
-
 // --- The video path ----------------------------------------------------------------------------
 
 /**
- * Parse, decode, draw and acknowledge video. Runs inside a worker that owns the video socket and
- * an OffscreenCanvas wherever the browser allows it, so a busy page (layout, charts, garbage
- * collection) never delays a frame; otherwise on the page's thread. Times it reports are
- * absolute (timeOrigin + now), since a worker's clock starts at a different moment.
+ * Everything video needs, in one self-contained function: it refers to nothing outside itself but
+ * browser globals. The page calls it, and so does the worker, which gets its source as text
+ * (`videoWorkerSource`), so bundlers that rename or inline module-level names cannot break the
+ * worker.
  */
-class VideoSink {
-  constructor(canvas, hooks) {
-    this.canvas = canvas;
-    this.ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
-    this.hooks = hooks;
-    this.decoder = null;
-    this.config = null;
-    this.sps = null;
-    this.pps = null;
-    this.pending = new Map();
-    this.askedKey = 0;
-    this.watch = false;
-    // Watchdog state, see check().
-    this.software = false;
-    this.needKey = false;
-    this.shownAt = 0;
-    this.stalls = 0;
-    this.black = 0;
-    this.probe = null;
+function videoCore() {
+  const MSG_VIDEO = 1;
+  const IN_ACK = 0x16;
+  const FLAG_KEY = 1;
+  const FLAG_REFINE = 2;
+  const CODECS = { 1: 'h264', 2: 'hevc', 3: 'av1' };
+
+  // --- Bitstream helpers ------------------------------------------------------------------------
+
+  /** Split an Annex B access unit into NAL units (without start codes). */
+  function splitAnnexB(buf) {
+    const out = [];
+    let i = 0;
+    let start = -1;
+    const n = buf.length;
+    while (i + 2 < n) {
+      if (buf[i] === 0 && buf[i + 1] === 0 && (buf[i + 2] === 1 || (buf[i + 2] === 0 && i + 3 < n && buf[i + 3] === 1))) {
+        const sc = buf[i + 2] === 1 ? 3 : 4;
+        if (start >= 0) out.push(buf.subarray(start, i));
+        i += sc;
+        start = i;
+      } else {
+        i++;
+      }
+    }
+    if (start >= 0) out.push(buf.subarray(start));
+    return out;
   }
 
-  static now() {
-    return performance.timeOrigin + performance.now();
+  function hex2(v) {
+    return v.toString(16).padStart(2, '0');
   }
 
-  onVideo(buf) {
-    const recv = VideoSink.now();
-    const b = new Uint8Array(buf);
-    const dv = new DataView(buf);
-    const flags = b[1];
-    const codec = CODECS[b[2]];
-    const id = dv.getUint32(4, true);
-    const width = dv.getUint16(8, true);
-    const height = dv.getUint16(10, true);
-    const data = b.subarray(28);
-    const key = (flags & FLAG_KEY) !== 0;
-    if (width !== this.canvas.width || height !== this.canvas.height) {
-      this.canvas.width = width;
-      this.canvas.height = height;
-      this.hooks.event({ t: 'size', width, height });
-    }
-    let chunkData = data;
-    if (codec === 'h264') {
-      const nals = splitAnnexB(data);
-      if (key) {
-        const sps = nals.find((n) => (n[0] & 0x1f) === 7);
-        const pps = nals.find((n) => (n[0] & 0x1f) === 8);
-        if (sps && pps && (!this.config || !bytesEqual(this.sps, sps) || !bytesEqual(this.pps, pps))) {
-          this.sps = sps;
-          this.pps = pps;
-          const { codec: cs, description } = avcConfig(sps, pps);
-          this.configure({ codec: cs, description, codedWidth: width, codedHeight: height });
-        }
-      }
-      chunkData = toAvcc(nals);
-    } else if (key && (!this.config || this.config._for !== codec)) {
-      const cs = codec === 'hevc' ? 'hvc1.1.6.L123.B0' : 'av01.0.08M.08';
-      this.configure({ codec: cs, codedWidth: width, codedHeight: height, _for: codec });
-    }
-    if (!this.decoder || this.decoder.state !== 'configured' || (this.needKey && !key)) {
-      if (recv - this.askedKey > 500) {
-        this.askedKey = recv;
-        this.hooks.send(JSON.stringify({ t: 'keyframe' }));
-      }
-      return;
-    }
-    if (key) this.needKey = false;
-    this.pending.set(id, {
-      recv,
-      captureUs: Number(dv.getBigUint64(12, true)),
-      queueUs: dv.getUint32(20, true),
-      encodeUs: dv.getUint32(24, true),
-      refine: (flags & FLAG_REFINE) !== 0,
-      key,
-      bytes: b.length,
+  /** H.264: build the avcC record and the `avc1.PPCCLL` codec string from SPS and PPS. */
+  function avcConfig(sps, pps) {
+    const rec = new Uint8Array(11 + sps.length + pps.length + 4);
+    let o = 0;
+    rec[o++] = 1;
+    rec[o++] = sps[1];
+    rec[o++] = sps[2];
+    rec[o++] = sps[3];
+    rec[o++] = 0xff; // 4-byte NAL lengths
+    rec[o++] = 0xe1; // one SPS
+    rec[o++] = sps.length >> 8;
+    rec[o++] = sps.length & 0xff;
+    rec.set(sps, o);
+    o += sps.length;
+    rec[o++] = 1; // one PPS
+    rec[o++] = pps.length >> 8;
+    rec[o++] = pps.length & 0xff;
+    rec.set(pps, o);
+    o += pps.length;
+    // High-profile extension: 4:2:0, 8-bit, no SPS extensions.
+    rec[o++] = 0xfd;
+    rec[o++] = 0xf8;
+    rec[o++] = 0xf8;
+    rec[o++] = 0;
+    const high = [100, 110, 122, 244, 44, 83, 86, 118, 128].includes(sps[1]);
+    return {
+      codec: `avc1.${hex2(sps[1])}${hex2(sps[2])}${hex2(sps[3])}`,
+      description: high ? rec : rec.subarray(0, o - 4),
+    };
+  }
+
+  /** Annex B access unit to length-prefixed (AVCC) samples, dropping parameter sets and AUDs. */
+  function toAvcc(nals) {
+    let len = 0;
+    const keep = nals.filter((n) => {
+      const t = n[0] & 0x1f;
+      return t !== 7 && t !== 8 && t !== 9;
     });
-    try {
-      this.decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: id, data: chunkData }));
-    } catch (e) {
-      this.failed(e);
+    for (const n of keep) len += 4 + n.length;
+    const out = new Uint8Array(len);
+    let o = 0;
+    for (const n of keep) {
+      out[o++] = n.length >>> 24;
+      out[o++] = (n.length >>> 16) & 0xff;
+      out[o++] = (n.length >>> 8) & 0xff;
+      out[o++] = n.length & 0xff;
+      out.set(n, o);
+      o += n.length;
     }
+    return out;
   }
 
-  configure(cfg) {
-    const { _for, ...config } = cfg;
-    if (!this.decoder || this.decoder.state === 'closed') {
-      this.decoder = new VideoDecoder({ output: (f) => this.onFrame(f), error: (e) => this.failed(e) });
-    }
-    try {
-      this.decoder.configure({
-        ...config,
-        optimizeForLatency: true,
-        hardwareAcceleration: this.software ? 'prefer-software' : 'no-preference',
-      });
-      this.config = { ...config, _for: _for || 'h264' };
-      this.hooks.event({ t: 'config', codec: config.codec });
-    } catch (e) {
-      this.failed(e);
-    }
-  }
-
-  failed(e) {
-    this.hooks.event({ t: 'error', message: `decoder: ${e.message || e}` });
-    this.close();
-    this.hooks.send(JSON.stringify({ t: 'keyframe' }));
-  }
-
-  onFrame(frame) {
-    const now = VideoSink.now();
-    const id = frame.timestamp;
-    const meta = this.pending.get(id);
-    this.pending.delete(id);
-    // Anything older than this frame was dropped by the decoder.
-    for (const k of this.pending.keys()) if (k < id) this.pending.delete(k);
-    // Paint on arrival: no waiting for an animation frame, the newest frame simply wins.
-    this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
-    this.shownAt = now;
-    if (meta) {
-      const ack = new ArrayBuffer(12);
-      const dv = new DataView(ack);
-      dv.setUint8(0, IN_ACK);
-      dv.setUint32(4, id, true);
-      dv.setUint32(8, Math.round((now - meta.recv) * 1000), true);
-      this.hooks.send(ack);
-    }
-    if (this.watch) {
-      // For latency measurements, which read pixels out of the decoded frame.
-      const copy = frame.clone();
-      this.hooks.event({ t: 'vframe', frame: copy, decoded: now, meta }, [copy]);
-    }
-    frame.close();
-    if (meta) this.hooks.event({ t: 'frame', decoded: now, ...meta });
-  }
-
-  /** A new stream (codec, size or monitor) starts with its own keyframe. */
-  reset() {
-    this.config = null;
-    this.shownAt = 0;
+  function bytesEqual(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
   }
 
   /**
-   * The watchdog, called once a second while connected: check that what the server sends reaches
-   * the screen. A decoder that sits on frames is flushed; one that keeps doing it, or that draws
-   * black while the server's picture (`luma`, its brightest sampled pixel) is not, is swapped for
-   * a software decoder. Reports `health` events; `connectedMs` is the time since connecting.
+   * Parse, decode, draw and acknowledge video. Runs inside a worker that owns the video socket and
+   * an OffscreenCanvas wherever the browser allows it, so a busy page (layout, charts, garbage
+   * collection) never delays a frame; otherwise on the page's thread. Times it reports are
+   * absolute (timeOrigin + now), since a worker's clock starts at a different moment.
    */
-  check(luma, connectedMs) {
-    const now = VideoSink.now();
-    // `final`: nothing left to try here, so the host page may want another transport.
-    const health = (issue, detail, final = false) => this.hooks.event({ t: 'health', issue, detail, final });
-    let oldest = Infinity;
-    for (const p of this.pending.values()) oldest = Math.min(oldest, p.recv);
-    if (this.decoder?.state === 'configured' && now - oldest > 1500 && this.shownAt < oldest) {
-      if (++this.stalls >= 2 && !this.software) {
-        this.useSoftware();
-        health('decoder-stall', 'the video decoder kept holding frames back; switched to the software decoder');
-      } else {
-        health('decoder-stall', `the video decoder held ${this.pending.size} frame(s) back for over 1.5 s`);
-        // flush() hands the held frames out; the decoder then needs a keyframe.
-        this.pending.clear();
-        this.needKey = true;
-        this.decoder.flush().then(() => this.hooks.send(JSON.stringify({ t: 'keyframe' })), () => {});
+  class VideoSink {
+    constructor(canvas, hooks) {
+      this.canvas = canvas;
+      this.ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+      this.hooks = hooks;
+      this.decoder = null;
+      this.config = null;
+      this.sps = null;
+      this.pps = null;
+      this.pending = new Map();
+      this.askedKey = 0;
+      this.watch = false;
+      // Watchdog state, see check().
+      this.software = false;
+      this.needKey = false;
+      this.shownAt = 0;
+      this.stalls = 0;
+      this.black = 0;
+      this.probe = null;
+    }
+
+    static now() {
+      return performance.timeOrigin + performance.now();
+    }
+
+    onVideo(buf) {
+      const recv = VideoSink.now();
+      const b = new Uint8Array(buf);
+      const dv = new DataView(buf);
+      const flags = b[1];
+      const codec = CODECS[b[2]];
+      const id = dv.getUint32(4, true);
+      const width = dv.getUint16(8, true);
+      const height = dv.getUint16(10, true);
+      const data = b.subarray(28);
+      const key = (flags & FLAG_KEY) !== 0;
+      if (width !== this.canvas.width || height !== this.canvas.height) {
+        this.canvas.width = width;
+        this.canvas.height = height;
+        this.hooks.event({ t: 'size', width, height });
       }
-      return;
-    }
-    if (!this.shownAt) {
-      if (connectedMs > 3000) this.hooks.send(JSON.stringify({ t: 'keyframe' }));
-      if (connectedMs > 8000) health('no-video', 'connected, but no picture has arrived', true);
-      return;
-    }
-    if (luma >= 48 && now - this.shownAt < 30000 && this.lumaMax() < 8) {
-      if (++this.black >= 3) {
-        this.black = 0;
-        if (!this.software) {
-          this.useSoftware();
-          health('black-output', 'the video decoder draws a black picture; switched to the software decoder');
-        } else {
-          health('black-output', 'the picture stays black even with the software decoder', true);
+      let chunkData = data;
+      if (codec === 'h264') {
+        const nals = splitAnnexB(data);
+        if (key) {
+          const sps = nals.find((n) => (n[0] & 0x1f) === 7);
+          const pps = nals.find((n) => (n[0] & 0x1f) === 8);
+          if (sps && pps && (!this.config || !bytesEqual(this.sps, sps) || !bytesEqual(this.pps, pps))) {
+            this.sps = sps;
+            this.pps = pps;
+            const { codec: cs, description } = avcConfig(sps, pps);
+            this.configure({ codec: cs, description, codedWidth: width, codedHeight: height });
+          }
         }
+        chunkData = toAvcc(nals);
+      } else if (key && (!this.config || this.config._for !== codec)) {
+        const cs = codec === 'hevc' ? 'hvc1.1.6.L123.B0' : 'av01.0.08M.08';
+        this.configure({ codec: cs, codedWidth: width, codedHeight: height, _for: codec });
       }
-      return;
+      if (!this.decoder || this.decoder.state !== 'configured' || (this.needKey && !key)) {
+        if (recv - this.askedKey > 500) {
+          this.askedKey = recv;
+          this.hooks.send(JSON.stringify({ t: 'keyframe' }));
+        }
+        return;
+      }
+      if (key) this.needKey = false;
+      this.pending.set(id, {
+        recv,
+        captureUs: Number(dv.getBigUint64(12, true)),
+        queueUs: dv.getUint32(20, true),
+        encodeUs: dv.getUint32(24, true),
+        refine: (flags & FLAG_REFINE) !== 0,
+        key,
+        bytes: b.length,
+      });
+      try {
+        this.decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: id, data: chunkData }));
+      } catch (e) {
+        this.failed(e);
+      }
     }
-    this.black = 0;
-    health(null, '');
-  }
 
-  lumaMax() {
-    if (!this.probe) {
-      const c = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(32, 18) : Object.assign(document.createElement('canvas'), { width: 32, height: 18 });
-      this.probe = c.getContext('2d', { willReadFrequently: true });
+    configure(cfg) {
+      const { _for, ...config } = cfg;
+      if (!this.decoder || this.decoder.state === 'closed') {
+        this.decoder = new VideoDecoder({ output: (f) => this.onFrame(f), error: (e) => this.failed(e) });
+      }
+      try {
+        this.decoder.configure({
+          ...config,
+          optimizeForLatency: true,
+          hardwareAcceleration: this.software ? 'prefer-software' : 'no-preference',
+        });
+        this.config = { ...config, _for: _for || 'h264' };
+        this.hooks.event({ t: 'config', codec: config.codec });
+      } catch (e) {
+        this.failed(e);
+      }
     }
-    this.probe.drawImage(this.canvas, 0, 0, 32, 18);
-    const d = this.probe.getImageData(0, 0, 32, 18).data;
-    let max = 0;
-    for (let i = 0; i < d.length; i += 4) max = Math.max(max, (d[i] * 54 + d[i + 1] * 183 + d[i + 2] * 19) >> 8);
-    return max;
+
+    failed(e) {
+      this.hooks.event({ t: 'error', message: `decoder: ${e.message || e}` });
+      this.close();
+      this.hooks.send(JSON.stringify({ t: 'keyframe' }));
+    }
+
+    onFrame(frame) {
+      const now = VideoSink.now();
+      const id = frame.timestamp;
+      const meta = this.pending.get(id);
+      this.pending.delete(id);
+      // Anything older than this frame was dropped by the decoder.
+      for (const k of this.pending.keys()) if (k < id) this.pending.delete(k);
+      // Paint on arrival: no waiting for an animation frame, the newest frame simply wins.
+      this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+      this.shownAt = now;
+      if (meta) {
+        const ack = new ArrayBuffer(12);
+        const dv = new DataView(ack);
+        dv.setUint8(0, IN_ACK);
+        dv.setUint32(4, id, true);
+        dv.setUint32(8, Math.round((now - meta.recv) * 1000), true);
+        this.hooks.send(ack);
+      }
+      if (this.watch) {
+        // For latency measurements, which read pixels out of the decoded frame.
+        const copy = frame.clone();
+        this.hooks.event({ t: 'vframe', frame: copy, decoded: now, meta }, [copy]);
+      }
+      frame.close();
+      if (meta) this.hooks.event({ t: 'frame', decoded: now, ...meta });
+    }
+
+    /** A new stream (codec, size or monitor) starts with its own keyframe. */
+    reset() {
+      this.config = null;
+      this.shownAt = 0;
+    }
+
+    /**
+     * The watchdog, called once a second while connected: check that what the server sends reaches
+     * the screen. A decoder that sits on frames is flushed; one that keeps doing it, or that draws
+     * black while the server's picture (`luma`, its brightest sampled pixel) is not, is swapped for
+     * a software decoder. Reports `health` events; `connectedMs` is the time since connecting.
+     */
+    check(luma, connectedMs) {
+      const now = VideoSink.now();
+      // `final`: nothing left to try here, so the host page may want another transport.
+      const health = (issue, detail, final = false) => this.hooks.event({ t: 'health', issue, detail, final });
+      let oldest = Infinity;
+      for (const p of this.pending.values()) oldest = Math.min(oldest, p.recv);
+      if (this.decoder?.state === 'configured' && now - oldest > 1500 && this.shownAt < oldest) {
+        if (++this.stalls >= 2 && !this.software) {
+          this.useSoftware();
+          health('decoder-stall', 'the video decoder kept holding frames back; switched to the software decoder');
+        } else {
+          health('decoder-stall', `the video decoder held ${this.pending.size} frame(s) back for over 1.5 s`);
+          // flush() hands the held frames out; the decoder then needs a keyframe.
+          this.pending.clear();
+          this.needKey = true;
+          this.decoder.flush().then(() => this.hooks.send(JSON.stringify({ t: 'keyframe' })), () => {});
+        }
+        return;
+      }
+      if (!this.shownAt) {
+        if (connectedMs > 3000) this.hooks.send(JSON.stringify({ t: 'keyframe' }));
+        if (connectedMs > 8000) health('no-video', 'connected, but no picture has arrived', true);
+        return;
+      }
+      if (luma >= 48 && now - this.shownAt < 30000 && this.lumaMax() < 8) {
+        if (++this.black >= 3) {
+          this.black = 0;
+          if (!this.software) {
+            this.useSoftware();
+            health('black-output', 'the video decoder draws a black picture; switched to the software decoder');
+          } else {
+            health('black-output', 'the picture stays black even with the software decoder', true);
+          }
+        }
+        return;
+      }
+      this.black = 0;
+      health(null, '');
+    }
+
+    lumaMax() {
+      if (!this.probe) {
+        const c = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(32, 18) : Object.assign(document.createElement('canvas'), { width: 32, height: 18 });
+        this.probe = c.getContext('2d', { willReadFrequently: true });
+      }
+      this.probe.drawImage(this.canvas, 0, 0, 32, 18);
+      const d = this.probe.getImageData(0, 0, 32, 18).data;
+      let max = 0;
+      for (let i = 0; i < d.length; i += 4) max = Math.max(max, (d[i] * 54 + d[i + 1] * 183 + d[i + 2] * 19) >> 8);
+      return max;
+    }
+
+    useSoftware() {
+      this.software = true;
+      this.close();
+      this.hooks.send(JSON.stringify({ t: 'keyframe' }));
+    }
+
+    close() {
+      if (this.decoder && this.decoder.state !== 'closed') this.decoder.close();
+      this.decoder = null;
+      this.config = null;
+      this.pending.clear();
+    }
   }
 
-  useSoftware() {
-    this.software = true;
-    this.close();
-    this.hooks.send(JSON.stringify({ t: 'keyframe' }));
-  }
-
-  close() {
-    if (this.decoder && this.decoder.state !== 'closed') this.decoder.close();
-    this.decoder = null;
-    this.config = null;
-    this.pending.clear();
-  }
+  return { MSG_VIDEO, splitAnnexB, avcConfig, VideoSink };
 }
 
+const core = videoCore();
+const VideoSink = core.VideoSink;
+/** Split an Annex B access unit into NAL units (without start codes). */
+export const splitAnnexB = core.splitAnnexB;
+/** H.264: build the avcC record and the `avc1.PPCCLL` codec string from SPS and PPS. */
+export const avcConfig = core.avcConfig;
+
 /** The worker: owns the main WebSocket and a VideoSink; everything else goes to the page. */
-function videoWorker() {
+function videoWorker(core) {
   let canvas = null;
   let ws = null;
   let sink = null;
@@ -391,7 +414,7 @@ function videoWorker() {
       sock.binaryType = 'arraybuffer';
       if (sink) sink.close();
       ws = sock;
-      sink = new VideoSink(canvas, {
+      sink = new core.VideoSink(canvas, {
         send: (d) => sock.readyState === 1 && sock.send(d),
         event: (ev, transfer) => self.postMessage({ ...ev, id }, transfer || []),
       });
@@ -407,7 +430,7 @@ function videoWorker() {
             } catch {}
           }
           self.postMessage({ t: 'text', id, data: ev.data });
-        } else if (new Uint8Array(ev.data, 0, 1)[0] === MSG_VIDEO) {
+        } else if (new Uint8Array(ev.data, 0, 1)[0] === core.MSG_VIDEO) {
           own.onVideo(ev.data);
         } else {
           self.postMessage({ t: 'binary', id, data: ev.data }, [ev.data]);
@@ -435,14 +458,12 @@ function videoWorker() {
   self.postMessage({ t: typeof VideoDecoder === 'undefined' || typeof OffscreenCanvas === 'undefined' ? 'unsupported' : 'ready' });
 }
 
-/** Source for the worker, built from this module's own code so embedding stays one file. */
+/**
+ * Source for the worker, built from this module's own code so embedding stays one file. Both
+ * functions are self-contained, so this survives minification.
+ */
 function videoWorkerSource() {
-  const consts = { MSG_VIDEO, IN_ACK, FLAG_KEY, FLAG_REFINE, CODECS };
-  return [
-    ...Object.entries(consts).map(([k, v]) => `const ${k} = ${JSON.stringify(v)};`),
-    ...[splitAnnexB, hex2, avcConfig, toAvcc, bytesEqual, VideoSink, videoWorker].map(String),
-    'videoWorker();',
-  ].join('\n');
+  return `(${videoWorker})((${videoCore})());`;
 }
 
 /** What `_open` needs of a WebSocket, for a socket that lives in the video worker. */

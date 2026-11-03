@@ -10,7 +10,9 @@
 //
 // Video arrives as H.264, HEVC or AV1 access units over a WebSocket and goes straight into a
 // WebCodecs VideoDecoder (hardware where the browser has it), then onto a canvas the moment it
-// is decoded. Every decoded frame is acknowledged so the server can pace itself.
+// is decoded. Every decoded frame is acknowledged so the server can pace itself. All of that runs
+// in a worker (built from this file, so there is still only one file to serve), so nothing the
+// page does can hold a frame back.
 
 const MSG_VIDEO = 1;
 const MSG_CURSOR_SHAPE = 2;
@@ -152,6 +154,232 @@ function bytesEqual(a, b) {
   return true;
 }
 
+// --- The video path ----------------------------------------------------------------------------
+
+/**
+ * Parse, decode, draw and acknowledge video. Runs inside a worker that owns the video socket and
+ * an OffscreenCanvas wherever the browser allows it, so a busy page (layout, charts, garbage
+ * collection) never delays a frame; otherwise on the page's thread. Times it reports are
+ * absolute (timeOrigin + now), since a worker's clock starts at a different moment.
+ */
+class VideoSink {
+  constructor(canvas, hooks) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+    this.hooks = hooks;
+    this.decoder = null;
+    this.config = null;
+    this.sps = null;
+    this.pps = null;
+    this.pending = new Map();
+    this.askedKey = 0;
+    this.watch = false;
+  }
+
+  static now() {
+    return performance.timeOrigin + performance.now();
+  }
+
+  onVideo(buf) {
+    const recv = VideoSink.now();
+    const b = new Uint8Array(buf);
+    const dv = new DataView(buf);
+    const flags = b[1];
+    const codec = CODECS[b[2]];
+    const id = dv.getUint32(4, true);
+    const width = dv.getUint16(8, true);
+    const height = dv.getUint16(10, true);
+    const data = b.subarray(28);
+    const key = (flags & FLAG_KEY) !== 0;
+    if (width !== this.canvas.width || height !== this.canvas.height) {
+      this.canvas.width = width;
+      this.canvas.height = height;
+      this.hooks.event({ t: 'size', width, height });
+    }
+    let chunkData = data;
+    if (codec === 'h264') {
+      const nals = splitAnnexB(data);
+      if (key) {
+        const sps = nals.find((n) => (n[0] & 0x1f) === 7);
+        const pps = nals.find((n) => (n[0] & 0x1f) === 8);
+        if (sps && pps && (!this.config || !bytesEqual(this.sps, sps) || !bytesEqual(this.pps, pps))) {
+          this.sps = sps;
+          this.pps = pps;
+          const { codec: cs, description } = avcConfig(sps, pps);
+          this.configure({ codec: cs, description, codedWidth: width, codedHeight: height });
+        }
+      }
+      chunkData = toAvcc(nals);
+    } else if (key && (!this.config || this.config._for !== codec)) {
+      const cs = codec === 'hevc' ? 'hvc1.1.6.L123.B0' : 'av01.0.08M.08';
+      this.configure({ codec: cs, codedWidth: width, codedHeight: height, _for: codec });
+    }
+    if (!this.decoder || this.decoder.state !== 'configured') {
+      if (recv - this.askedKey > 500) {
+        this.askedKey = recv;
+        this.hooks.send(JSON.stringify({ t: 'keyframe' }));
+      }
+      return;
+    }
+    this.pending.set(id, {
+      recv,
+      captureUs: Number(dv.getBigUint64(12, true)),
+      queueUs: dv.getUint32(20, true),
+      encodeUs: dv.getUint32(24, true),
+      refine: (flags & FLAG_REFINE) !== 0,
+      bytes: b.length,
+    });
+    try {
+      this.decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: id, data: chunkData }));
+    } catch (e) {
+      this.failed(e);
+    }
+  }
+
+  configure(cfg) {
+    const { _for, ...config } = cfg;
+    if (!this.decoder || this.decoder.state === 'closed') {
+      this.decoder = new VideoDecoder({ output: (f) => this.onFrame(f), error: (e) => this.failed(e) });
+    }
+    try {
+      this.decoder.configure({ ...config, optimizeForLatency: true, hardwareAcceleration: 'no-preference' });
+      this.config = { ...config, _for: _for || 'h264' };
+      this.hooks.event({ t: 'config', codec: config.codec });
+    } catch (e) {
+      this.failed(e);
+    }
+  }
+
+  failed(e) {
+    this.hooks.event({ t: 'error', message: `decoder: ${e.message || e}` });
+    this.close();
+    this.hooks.send(JSON.stringify({ t: 'keyframe' }));
+  }
+
+  onFrame(frame) {
+    const now = VideoSink.now();
+    const id = frame.timestamp;
+    const meta = this.pending.get(id);
+    this.pending.delete(id);
+    // Anything older than this frame was dropped by the decoder.
+    for (const k of this.pending.keys()) if (k < id) this.pending.delete(k);
+    // Paint on arrival: no waiting for an animation frame, the newest frame simply wins.
+    this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+    if (meta) {
+      const ack = new ArrayBuffer(12);
+      const dv = new DataView(ack);
+      dv.setUint8(0, IN_ACK);
+      dv.setUint32(4, id, true);
+      dv.setUint32(8, Math.round((now - meta.recv) * 1000), true);
+      this.hooks.send(ack);
+    }
+    if (this.watch) {
+      // For latency measurements, which read pixels out of the decoded frame.
+      const copy = frame.clone();
+      this.hooks.event({ t: 'vframe', frame: copy, decoded: now, meta }, [copy]);
+    }
+    frame.close();
+    if (meta) this.hooks.event({ t: 'frame', decoded: now, ...meta });
+  }
+
+  /** A new stream (codec, size or monitor) starts with its own keyframe. */
+  reset() {
+    this.config = null;
+  }
+
+  close() {
+    if (this.decoder && this.decoder.state !== 'closed') this.decoder.close();
+    this.decoder = null;
+    this.config = null;
+    this.pending.clear();
+  }
+}
+
+/** The worker: owns the main WebSocket and a VideoSink; everything else goes to the page. */
+function videoWorker() {
+  let canvas = null;
+  let ws = null;
+  let sink = null;
+  let watch = false;
+  self.onmessage = (e) => {
+    const m = e.data;
+    if (m.t === 'canvas') {
+      canvas = m.canvas;
+    } else if (m.t === 'open') {
+      const id = m.id;
+      const sock = new WebSocket(m.url);
+      sock.binaryType = 'arraybuffer';
+      if (sink) sink.close();
+      ws = sock;
+      sink = new VideoSink(canvas, {
+        send: (d) => sock.readyState === 1 && sock.send(d),
+        event: (ev, transfer) => self.postMessage({ ...ev, id }, transfer || []),
+      });
+      sink.watch = watch;
+      const own = sink;
+      sock.onopen = () => self.postMessage({ t: 'open', id });
+      sock.onmessage = (ev) => {
+        if (typeof ev.data === 'string') {
+          if (ev.data.includes('"stream"')) {
+            try {
+              if (JSON.parse(ev.data).t === 'stream') own.reset();
+            } catch {}
+          }
+          self.postMessage({ t: 'text', id, data: ev.data });
+        } else if (new Uint8Array(ev.data, 0, 1)[0] === MSG_VIDEO) {
+          own.onVideo(ev.data);
+        } else {
+          self.postMessage({ t: 'binary', id, data: ev.data }, [ev.data]);
+        }
+      };
+      sock.onclose = () => {
+        own.close();
+        if (ws === sock) ws = null;
+        self.postMessage({ t: 'close', id });
+      };
+    } else if (m.t === 'send') {
+      if (ws && ws.readyState === 1) ws.send(m.data);
+    } else if (m.t === 'close') {
+      if (ws) ws.close();
+    } else if (m.t === 'watch') {
+      watch = m.on;
+      if (sink) sink.watch = m.on;
+    }
+  };
+}
+
+/** Source for the worker, built from this module's own code so embedding stays one file. */
+function videoWorkerSource() {
+  const consts = { MSG_VIDEO, IN_ACK, FLAG_KEY, FLAG_REFINE, CODECS };
+  return [
+    ...Object.entries(consts).map(([k, v]) => `const ${k} = ${JSON.stringify(v)};`),
+    ...[splitAnnexB, hex2, avcConfig, toAvcc, bytesEqual, VideoSink, videoWorker].map(String),
+    'videoWorker();',
+  ].join('\n');
+}
+
+/** What `_open` needs of a WebSocket, for a socket that lives in the video worker. */
+class WorkerSocket {
+  constructor(worker, url, id) {
+    this.worker = worker;
+    this.id = id;
+    this.readyState = 0;
+    this.binaryType = 'arraybuffer';
+    worker.postMessage({ t: 'open', url, id });
+  }
+
+  send(data) {
+    if (this.readyState === 1) this.worker.postMessage({ t: 'send', data });
+  }
+
+  close() {
+    if (this.readyState < 2) {
+      this.readyState = 2;
+      this.worker.postMessage({ t: 'close' });
+    }
+  }
+}
+
 // --- The client ---------------------------------------------------------------------------------
 
 export class Skylight extends EventTarget {
@@ -182,10 +410,8 @@ export class Skylight extends EventTarget {
     this.serverStats = {};
     this.stats = {};
     this.ws = null;
-    this.decoder = null;
     this.decoderConfig = null;
     this.streamInfo = null;
-    this.pending = new Map();
     this.width = 0;
     this.height = 0;
     this.cursor = { x: 0, y: 0, visible: true, url: null, hotX: 0, hotY: 0, w: 0, h: 0, rgba: null };
@@ -305,6 +531,7 @@ export class Skylight extends EventTarget {
     });
     const [px, py, pw, ph] = probe;
     this._benchWatch = { probe };
+    this._watchFrames(true);
     this._rafTimes = [];
     const tick = (t) => {
       if (!this._benchWatch) return;
@@ -368,6 +595,7 @@ export class Skylight extends EventTarget {
     } finally {
       this.bench = null;
       this._benchWatch = null;
+      this._watchFrames(false);
       this._send({ t: 'bench', action: 'stop' });
     }
     const sum = (v) => ({
@@ -393,8 +621,10 @@ export class Skylight extends EventTarget {
     await new Promise((r) => setTimeout(r, 1000));
     tc.start = performance.now();
     this._timecode = tc;
+    this._watchFrames(true);
     await new Promise((r) => setTimeout(r, seconds * 1000));
     this._timecode = null;
+    this._watchFrames(false);
     const secs = (performance.now() - tc.start) / 1000;
     await this.showProbe(null);
     const sum = (v) => ({ median: median(v), p95: percentile(v, 0.95), min: Math.min(...v), max: Math.max(...v) });
@@ -517,7 +747,30 @@ export class Skylight extends EventTarget {
     this.canvas = canvas;
     this.cursorEl = cursor;
     this.ime = ime;
-    this.ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+    // Video goes to a worker with an OffscreenCanvas where possible (opts.worker = false keeps
+    // it on this thread). A page whose CSP forbids blob: workers falls back here too.
+    this.worker = null;
+    if (this.opts.worker !== false && typeof Worker !== 'undefined' && 'transferControlToOffscreen' in canvas) {
+      try {
+        const url = URL.createObjectURL(new Blob([videoWorkerSource()], { type: 'text/javascript' }));
+        const worker = new Worker(url);
+        URL.revokeObjectURL(url);
+        const offscreen = canvas.transferControlToOffscreen();
+        worker.postMessage({ t: 'canvas', canvas: offscreen }, [offscreen]);
+        worker.onmessage = (e) => this._onWorker(e.data);
+        this.worker = worker;
+      } catch {
+        this.worker = null;
+      }
+    }
+    this._sockets = 0;
+    this._wsock = null;
+    if (!this.worker) {
+      this._sink = new VideoSink(canvas, {
+        send: (d) => (typeof d === 'string' ? this.ws && this.ws.readyState === 1 && this.ws.send(d) : this._sendBin(d)),
+        event: (ev) => this._onSinkEvent(ev),
+      });
+    }
     this._ro = new ResizeObserver(() => this._layout());
     this._ro.observe(root);
   }
@@ -563,7 +816,7 @@ export class Skylight extends EventTarget {
 
   _open(url, ticket) {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(url);
+      const ws = this.worker ? (this._wsock = new WorkerSocket(this.worker, url, ++this._sockets)) : new WebSocket(url);
       ws.binaryType = 'arraybuffer';
       let settled = false;
       let opened = false;
@@ -643,10 +896,8 @@ export class Skylight extends EventTarget {
     this._releaseAll();
     if (this.inputWs) this.inputWs.close();
     this.inputWs = null;
-    if (this.decoder && this.decoder.state !== 'closed') this.decoder.close();
-    this.decoder = null;
+    if (this._sink) this._sink.close();
     this.decoderConfig = null;
-    this.pending.clear();
   }
 
   _send(obj) {
@@ -673,6 +924,7 @@ export class Skylight extends EventTarget {
 
   /** Input gets its own socket so a click never queues behind acks or control messages. */
   _openInput(token, attempt = 0) {
+    this._lastPointer = null;
     const url = this._url.replace(/\/ws(\?.*)?$/, '/input');
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
@@ -718,6 +970,7 @@ export class Skylight extends EventTarget {
         this.streamInfo = m;
         this.monitor = m.monitor;
         this.decoderConfig = null;
+        if (this._sink) this._sink.reset();
         this.dispatchEvent(new CustomEvent('monitors', { detail: { monitors: this.monitors, current: m.monitor } }));
         break;
       case 'stats':
@@ -743,7 +996,7 @@ export class Skylight extends EventTarget {
     const b = new Uint8Array(buf);
     const dv = new DataView(buf);
     if (b[0] === MSG_VIDEO) {
-      this._onVideo(b, dv);
+      this._sink.onVideo(buf);
     } else if (b[0] === MSG_CURSOR_SHAPE) {
       const w = dv.getUint16(8, true);
       const h = dv.getUint16(10, true);
@@ -756,123 +1009,89 @@ export class Skylight extends EventTarget {
     }
   }
 
-  _onVideo(b, dv) {
-    const recv = performance.now();
-    const flags = b[1];
-    const codec = CODECS[b[2]];
-    const id = dv.getUint32(4, true);
-    const width = dv.getUint16(8, true);
-    const height = dv.getUint16(10, true);
-    const captureUs = Number(dv.getBigUint64(12, true));
-    const queueUs = dv.getUint32(20, true);
-    const encodeUs = dv.getUint32(24, true);
-    const data = b.subarray(28);
-    const key = (flags & FLAG_KEY) !== 0;
-    this.win.bytes += b.length;
-
-    if (width !== this.width || height !== this.height) {
-      this.width = width;
-      this.height = height;
-      this.canvas.width = width;
-      this.canvas.height = height;
-      this.vcursor = { x: width / 2, y: height / 2 };
-      this._layout();
+  /** Messages from the video worker: socket events for `_open`, the rest as sink events. */
+  _onWorker(m) {
+    const s = this._wsock;
+    const mine = s && m.id === s.id;
+    if (m.t === 'open') {
+      if (mine) {
+        s.readyState = 1;
+        if (s.onopen) s.onopen();
+      }
+    } else if (m.t === 'text' || m.t === 'binary') {
+      if (mine && s.onmessage) s.onmessage({ data: m.data });
+    } else if (m.t === 'close') {
+      if (mine) {
+        s.readyState = 3;
+        this._wsock = null;
+        if (s.onclose) s.onclose();
+      }
+    } else if (mine) {
+      if (m.t === 'frame') {
+        this.received.messages++;
+        this.received.bytes += m.bytes;
+      }
+      this._onSinkEvent(m);
+    } else if (m.t === 'vframe') {
+      m.frame.close();
     }
+  }
 
-    let chunkData = data;
-    if (codec === 'h264') {
-      const nals = splitAnnexB(data);
-      if (key) {
-        const sps = nals.find((n) => (n[0] & 0x1f) === 7);
-        const pps = nals.find((n) => (n[0] & 0x1f) === 8);
-        if (sps && pps && (!this.decoderConfig || !bytesEqual(this._sps, sps) || !bytesEqual(this._pps, pps))) {
-          this._sps = sps;
-          this._pps = pps;
-          const { codec: cs, description } = avcConfig(sps, pps);
-          this._configure({ codec: cs, description, codedWidth: width, codedHeight: height });
+  _onSinkEvent(m) {
+    const local = (t) => t - performance.timeOrigin;
+    switch (m.t) {
+      case 'size':
+        this.width = m.width;
+        this.height = m.height;
+        this.vcursor = { x: m.width / 2, y: m.height / 2 };
+        this._layout();
+        break;
+      case 'config':
+        this.decoderConfig = { codec: m.codec };
+        break;
+      case 'error':
+        this.dispatchEvent(new CustomEvent('error', { detail: m.message }));
+        break;
+      case 'vframe': {
+        const now = local(m.decoded);
+        const meta = m.meta && { ...m.meta, recv: local(m.meta.recv) };
+        if (this.bench || this._benchWatch) this._benchCheck(m.frame, now, meta);
+        if (this._timecode) this._timecodeCheck(m.frame, now);
+        m.frame.close();
+        break;
+      }
+      case 'frame': {
+        const now = local(m.decoded);
+        const recv = local(m.recv);
+        const w = this.win;
+        w.frames++;
+        w.bytes += m.bytes;
+        if (w.lastFrame) w.intervals.push(now - w.lastFrame);
+        w.lastFrame = now;
+        w.decode.push(now - recv);
+        if (!m.refine) {
+          const captureLocal = m.captureUs / 1000 - this.clock.offset;
+          const encoded = captureLocal + (m.queueUs + m.encodeUs) / 1000;
+          w.network.push(Math.max(0, recv - encoded));
+          w.server.push((m.queueUs + m.encodeUs) / 1000);
+          requestAnimationFrame((t) => {
+            // rAF time is when this frame's composite begins; the drawn canvas shows with it.
+            w.e2e.push(Math.max(t, now) - captureLocal);
+            w.display.push(Math.max(0, t - now));
+          });
+        } else {
+          w.refines++;
         }
+        break;
       }
-      chunkData = toAvcc(nals);
-    } else if (key && (!this.decoderConfig || this.decoderConfig._for !== codec)) {
-      const cs = codec === 'hevc' ? 'hvc1.1.6.L123.B0' : 'av01.0.08M.08';
-      this._configure({ codec: cs, codedWidth: width, codedHeight: height, _for: codec });
-    }
-    if (!this.decoder || this.decoder.state !== 'configured') {
-      if (!this._askedKey || recv - this._askedKey > 500) {
-        this._askedKey = recv;
-        this.requestKeyframe();
-      }
-      return;
-    }
-    this.pending.set(id, { recv, captureUs, queueUs, encodeUs, refine: (flags & FLAG_REFINE) !== 0, bytes: b.length });
-    try {
-      this.decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: id, data: chunkData }));
-    } catch (e) {
-      this._decoderFailed(e);
+      default:
     }
   }
 
-  _configure(cfg) {
-    const { _for, ...config } = cfg;
-    if (!this.decoder || this.decoder.state === 'closed') {
-      this.decoder = new VideoDecoder({
-        output: (frame) => this._onFrame(frame),
-        error: (e) => this._decoderFailed(e),
-      });
-    }
-    try {
-      this.decoder.configure({ ...config, optimizeForLatency: true, hardwareAcceleration: 'no-preference' });
-      this.decoderConfig = { ...config, _for: _for || 'h264' };
-    } catch (e) {
-      this._decoderFailed(e);
-    }
-  }
-
-  _decoderFailed(e) {
-    this.dispatchEvent(new CustomEvent('error', { detail: `decoder: ${e.message || e}` }));
-    if (this.decoder && this.decoder.state !== 'closed') this.decoder.close();
-    this.decoder = null;
-    this.decoderConfig = null;
-    this.pending.clear();
-    this.requestKeyframe();
-  }
-
-  _onFrame(frame) {
-    const now = performance.now();
-    const id = frame.timestamp;
-    const meta = this.pending.get(id);
-    this.pending.delete(id);
-    // Anything older than this frame was dropped by the decoder.
-    for (const k of this.pending.keys()) if (k < id) this.pending.delete(k);
-    this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
-    if (this.bench || this._benchWatch) this._benchCheck(frame, now, meta);
-    if (this._timecode) this._timecodeCheck(frame, now);
-    frame.close();
-    if (!meta) return;
-    const ack = new ArrayBuffer(12);
-    const dv = new DataView(ack);
-    dv.setUint8(0, IN_ACK);
-    dv.setUint32(4, id, true);
-    dv.setUint32(8, Math.round((now - meta.recv) * 1000), true);
-    this._sendBin(ack);
-    const w = this.win;
-    w.frames++;
-    if (w.lastFrame) w.intervals.push(now - w.lastFrame);
-    w.lastFrame = now;
-    w.decode.push(now - meta.recv);
-    if (!meta.refine) {
-      const captureLocal = meta.captureUs / 1000 - this.clock.offset;
-      const encoded = captureLocal + (meta.queueUs + meta.encodeUs) / 1000;
-      w.network.push(Math.max(0, meta.recv - encoded));
-      w.server.push((meta.queueUs + meta.encodeUs) / 1000);
-      requestAnimationFrame((t) => {
-        // rAF time is when this frame's composite begins; the drawn canvas shows with it.
-        w.e2e.push(Math.max(t, now) - captureLocal);
-        w.display.push(Math.max(0, t - now));
-      });
-    } else {
-      w.refines++;
-    }
+  /** Hand decoded frames to the latency measurements while one runs. */
+  _watchFrames(on) {
+    if (this.worker) this.worker.postMessage({ t: 'watch', on });
+    else this._sink.watch = on;
   }
 
   _newWindow() {
@@ -991,6 +1210,12 @@ export class Skylight extends EventTarget {
   }
 
   _pointer(x, y) {
+    // Only moves that land somewhere new (pointer events fire for sub-pixel moves, and with
+    // pointerrawupdate at the mouse's own rate).
+    const qx = Math.round(x * 2) / 2;
+    const qy = Math.round(y * 2) / 2;
+    if (this._lastPointer && this._lastPointer.x === qx && this._lastPointer.y === qy) return;
+    this._lastPointer = { x: qx, y: qy };
     const m = new ArrayBuffer(12);
     const dv = new DataView(m);
     dv.setUint8(0, IN_POINTER_ABS);

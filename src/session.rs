@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::capture::{self, Capture, Hub, InputSink, MonitorInfo};
@@ -64,14 +64,25 @@ pub struct InputCtx {
 
 impl InputCtx {
     fn handle(&self, inp: Input) {
+        self.handle_batch(vec![inp]);
+    }
+
+    /// Inject a batch in order, with runs of pointer moves collapsed to the last one (a backlog
+    /// of moves is only worth its end point), then flush once.
+    fn handle_batch(&self, batch: Vec<Input>) {
         self.last_input_us.store(clock::now_us(), Ordering::Relaxed);
         let mon = self.mon.lock().unwrap().clone();
-        handle_input(
-            self.sink.as_ref(),
-            &mon,
-            inp,
-            &mut self.held.lock().unwrap(),
-        );
+        let mut held = self.held.lock().unwrap();
+        let mut it = batch.into_iter().peekable();
+        while let Some(inp) = it.next() {
+            if matches!(inp, Input::PointerAbs { .. })
+                && matches!(it.peek(), Some(Input::PointerAbs { .. }))
+            {
+                continue;
+            }
+            handle_input(self.sink.as_ref(), &mon, inp, &mut held);
+        }
+        self.sink.flush();
     }
 
     fn shutdown(&self) {
@@ -98,10 +109,29 @@ pub async fn run_input(socket: WebSocket, app: Arc<App>) {
         tokio::select! {
             msg = stream.next() => match msg {
                 Some(Ok(Message::Binary(b))) => {
-                    if let Some(inp) = proto::parse_input(&b)
-                        && !matches!(inp, Input::Ack { .. })
-                    {
-                        ctx.handle(inp);
+                    // Take whatever else has already arrived too, and inject it as one batch.
+                    let mut batch = Vec::new();
+                    let mut closed = false;
+                    let mut next = Some(b);
+                    while let Some(b) = next.take() {
+                        if let Some(inp) = proto::parse_input(&b)
+                            && !matches!(inp, Input::Ack { .. })
+                        {
+                            batch.push(inp);
+                        }
+                        if batch.len() >= 256 {
+                            ctx.handle_batch(std::mem::take(&mut batch));
+                        }
+                        match stream.next().now_or_never() {
+                            Some(Some(Ok(Message::Binary(b)))) => next = Some(b),
+                            Some(Some(Ok(Message::Close(_)))) | Some(None) | Some(Some(Err(_))) => closed = true,
+                            // Nothing waiting (or a frame this socket ignores anyway).
+                            _ => {}
+                        }
+                    }
+                    ctx.handle_batch(batch);
+                    if closed {
+                        break;
                     }
                 }
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
@@ -552,7 +582,6 @@ fn handle_input(sink: &dyn InputSink, mon: &MonitorInfo, inp: Input, held: &mut 
         }
         Input::Ack { .. } => {}
     }
-    sink.flush();
 }
 
 async fn start_probe(
@@ -825,13 +854,17 @@ fn encoder_loop(
         let new_content = seq != last_seq || generation != last_gen;
         // Changes waiting at an on-demand source (X11): asked for below, once a frame may go.
         let pending = !new_content && store.pending();
+        // Refinements go one at a time, each after the previous frame was acknowledged: on a
+        // slow link a burst of them would sit in front of the frame that answers the next click.
+        let link_idle = sh.pacer.lock().unwrap().inflight() == 0;
         let refine_due = cfg.refine
             && refine_left > 0
             && !new_content
             && !pending
+            && link_idle
             && now.duration_since(last_content) >= REFINE_AFTER;
         if !new_content && !pending && !need_key && !refine_due {
-            if cfg.refine && refine_left > 0 {
+            if cfg.refine && refine_left > 0 && link_idle {
                 timeout = REFINE_AFTER
                     .saturating_sub(now.duration_since(last_content))
                     .max(Duration::from_millis(1));

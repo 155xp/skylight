@@ -40,7 +40,7 @@ const t0 = Date.now();
 // Tunnels sometimes reset a fresh connection; retry the page load (the ticket is not spent yet).
 for (let attempt = 1; ; attempt++) {
   try {
-    await page.goto(`${base}#ticket=${ticket}&stats`);
+    await page.goto(`${base}#ticket=${ticket}&stats${flag('no-worker') ? '&noworker' : ''}`);
     break;
   } catch (e) {
     if (attempt >= 4) throw e;
@@ -52,6 +52,15 @@ await page.waitForFunction(() => window.skylight && window.skylight.state === 'c
 const connectMs = Date.now() - t0;
 await page.waitForFunction(() => window.skylight.width > 0, null, { timeout: 10000 });
 await page.waitForTimeout(1500);
+if (arg('jank')) {
+  // A busy page: block the page's thread for N ms out of every 50 (heavy layout, charts, GC).
+  await page.evaluate((ms) => {
+    setInterval(() => {
+      const end = performance.now() + ms;
+      while (performance.now() < end);
+    }, 50);
+  }, Number(arg('jank')));
+}
 
 const result = { base, when: new Date().toISOString(), connectMs, latency: {}, motion: null };
 const info = await page.evaluate(() => ({

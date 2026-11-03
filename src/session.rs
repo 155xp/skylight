@@ -24,6 +24,8 @@ use crate::ticket::{self, Claims, Verifier};
 
 pub struct Config {
     pub max_fps: u32,
+    /// Frame-rate cap for viewers whose best round trip is over `REMOTE_RTT_US`; 0 for none.
+    pub remote_max_fps: u32,
     pub max_bitrate: u64,
     pub start_bitrate: u64,
     pub min_bitrate: u64,
@@ -741,6 +743,9 @@ impl Stats {
 /// cap, so the frame that answers a click or key press never waits for a pacing slot.
 const INPUT_FAST_PATH_US: u64 = 250_000;
 
+/// A viewer whose best round trip is longer than this is on a long path (`remote_max_fps`).
+const REMOTE_RTT_US: u64 = 20_000;
+
 /// What the encoder thread shares with the rest of its session.
 struct EncoderCtx {
     input: Option<Arc<InputCtx>>,
@@ -1023,10 +1028,27 @@ fn encoder_loop(
         }
         let recent_input =
             now_us.saturating_sub(last_input_us.load(Ordering::Relaxed)) < INPUT_FAST_PATH_US;
+        // Far away (a tunnel, the internet), frames arrive with the path's jitter: past
+        // `remote_max_fps` more of them only make the motion less even and cost bytes.
+        let (path_fps, remote) = {
+            let mut p = sh.pacer.lock().unwrap();
+            let remote = p.min_rtt_us > REMOTE_RTT_US;
+            let f = if cfg.remote_max_fps > 0 && remote {
+                fps.min(cfg.remote_max_fps)
+            } else {
+                fps
+            };
+            p.frame_interval_us = 1_000_000 / f.max(1) as u64;
+            (f, remote)
+        };
+        let frame_us = 1_000_000 / path_fps.max(1) as u64;
+        // Right after input the frame that answers it goes at once. Far away that is at most every
+        // half frame: while the mouse keeps moving, every compositor frame (144 a second on a fast
+        // monitor) would otherwise go out, unevenly.
         let interval = if recent_input && (new_content || pending) {
-            Duration::ZERO
+            Duration::from_micros(if remote { frame_us / 2 } else { 0 })
         } else {
-            Duration::from_micros(1_000_000 / fps.max(1) as u64)
+            Duration::from_micros(frame_us)
         };
         let since = now.duration_since(last_encode);
         if since < interval && !need_key {

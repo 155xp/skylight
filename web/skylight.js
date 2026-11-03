@@ -235,6 +235,7 @@ class VideoSink {
       queueUs: dv.getUint32(20, true),
       encodeUs: dv.getUint32(24, true),
       refine: (flags & FLAG_REFINE) !== 0,
+      key,
       bytes: b.length,
     });
     try {
@@ -1015,6 +1016,8 @@ export class Skylight extends EventTarget {
     this._releaseAll();
     if (this.inputWs) this.inputWs.close();
     this.inputWs = null;
+    this._inputQueue = null;
+    clearTimeout(this._inputTimer);
     if (this._sink) this._sink.close();
     this.decoderConfig = null;
   }
@@ -1046,27 +1049,61 @@ export class Skylight extends EventTarget {
   }
 
   /** Input gets its own socket so a click never queues behind acks or control messages. */
+  /**
+   * Input travels on its own socket, but only ever on one socket at a time: while it opens, input
+   * is held and then sent in order on it. Split across two sockets, a button press could overtake
+   * its own release (a lost click or a stuck button right after connecting). If it cannot open,
+   * everything goes on the main socket for the rest of the session.
+   */
   _openInput(token, attempt = 0) {
-    this._lastPointer = null;
+    if (attempt === 0) {
+      this._lastPointer = null;
+      this._inputQueue = [];
+      clearTimeout(this._inputTimer);
+      this._inputTimer = setTimeout(() => this._inputOnMain(), 2000);
+    }
+    if (!this._inputQueue) return;
     const url = this._url.replace(/\/ws(\?.*)?$/, '/input');
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
     let opened = false;
     ws.onopen = () => {
+      if (!this._inputQueue) {
+        ws.close();
+        return;
+      }
       opened = true;
+      clearTimeout(this._inputTimer);
       ws.send(JSON.stringify({ token }));
+      for (const b of this._inputQueue) ws.send(b);
+      this._inputQueue = null;
       this.inputWs = ws;
     };
     ws.onclose = () => {
       if (this.inputWs === ws) this.inputWs = null;
-      // The token is unspent if the socket never opened; until then input rides the main socket.
-      if (!opened && attempt < 3 && this.ws) setTimeout(() => this._openInput(token, attempt + 1), 200);
+      // The token is unspent if the socket never opened.
+      if (opened) return;
+      if (attempt < 3 && this.ws) setTimeout(() => this._openInput(token, attempt + 1), 200);
+      else this._inputOnMain();
     };
   }
 
+  /** The input socket did not open: send what waited, and everything after, on the main socket. */
+  _inputOnMain() {
+    const q = this._inputQueue;
+    this._inputQueue = null;
+    clearTimeout(this._inputTimer);
+    if (q && this.ws && this.ws.readyState === 1) for (const b of q) this.ws.send(b);
+  }
+
   _sendInput(buf) {
-    const ws = this.inputWs && this.inputWs.readyState === 1 ? this.inputWs : this.ws;
-    if (ws && ws.readyState === 1) ws.send(buf);
+    if (this.inputWs && this.inputWs.readyState === 1) {
+      this.inputWs.send(buf);
+    } else if (this._inputQueue) {
+      if (this._inputQueue.length < 1024) this._inputQueue.push(buf);
+    } else if (this.ws && this.ws.readyState === 1) {
+      this.ws.send(buf);
+    }
   }
 
   _ping() {

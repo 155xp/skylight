@@ -83,6 +83,10 @@ enum Cmd {
         /// Frame-rate cap; clients may ask for less.
         #[arg(long, default_value_t = 144)]
         max_fps: u32,
+        /// Frame-rate cap when the viewer is far away (best round trip over 20 ms, such as a public
+        /// tunnel): beyond 60 the path's jitter makes frames uneven rather than smoother. 0 lifts it.
+        #[arg(long, default_value_t = 60)]
+        remote_max_fps: u32,
         /// Bitrate cap in Mbit/s.
         #[arg(long, default_value_t = 50.0)]
         max_mbps: f64,
@@ -210,6 +214,7 @@ fn main() -> Result<()> {
             backend,
             encoder,
             max_fps,
+            remote_max_fps,
             max_mbps,
             start_mbps,
             nvenc_preset,
@@ -243,6 +248,7 @@ fn main() -> Result<()> {
                 verifier: ticket::Verifier::new(keys, audience.clone()),
                 config: session::Config {
                     max_fps,
+                    remote_max_fps,
                     max_bitrate: mbps(max_mbps),
                     start_bitrate: mbps(start_mbps.min(max_mbps)),
                     min_bitrate: mbps(0.5),

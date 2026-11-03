@@ -9,8 +9,8 @@
 //!   *before* encoding it (so no reference frame is ever lost) and takes the newest image once
 //!   acks catch up; damage accumulates meanwhile, so nothing is lost. On TCP this is what keeps a
 //!   slow link from building seconds of buffered video.
-//! * **Bitrate.** A delay-based controller: when queueing delay appears (round trips above the
-//!   recent minimum, or frames stuck in flight), the target drops below the rate the browser
+//! * **Bitrate.** A delay-based controller: when queueing delay appears (even the best round trip
+//!   of the last half second sits above the long-term minimum, or frames are stuck in flight), the target drops below the rate the browser
 //!   actually acknowledged, and that rate is remembered as the path's ceiling for a while. While
 //!   the link is clear it climbs: fast at first, carefully near the ceiling, then probing gently
 //!   above it. It only climbs while the content uses the bitrate it has; a still screen says
@@ -46,6 +46,8 @@ pub struct Pacer {
 }
 
 const RTT_WINDOW_US: u64 = 10_000_000;
+/// Queueing delay is judged from the best round trip over this window.
+const QUEUE_WINDOW_US: u64 = 500_000;
 const RATE_WINDOW_US: u64 = 1_000_000;
 const ADJUST_EVERY_US: u64 = 200_000;
 const CUT_EVERY_US: u64 = 300_000;
@@ -130,7 +132,20 @@ impl Pacer {
         } else {
             self.min_rtt_us
         };
-        base + (2 * self.frame_interval_us).max(25_000).max(base / 2)
+        // A relay or Wi-Fi hop jitters by a good part of its round trip without any queue, so the
+        // slack grows with the base round trip.
+        base + (2 * self.frame_interval_us).max(25_000).max(base)
+    }
+
+    /// The smallest round trip in the last `QUEUE_WINDOW_US`: jitter only adds to single
+    /// samples, so this rises only when a queue has built up and every frame waits in it.
+    fn recent_min_rtt_us(&self, now_us: u64) -> Option<u64> {
+        self.rtt_samples
+            .iter()
+            .rev()
+            .take_while(|(t, _)| t + QUEUE_WINDOW_US >= now_us)
+            .map(|(_, r)| *r)
+            .min()
     }
 
     /// How many frames the path holds: one round trip plus some slack, in frames.
@@ -198,11 +213,14 @@ impl Pacer {
         if self.ceiling.is_some_and(|(_, until)| now_us > until) {
             self.ceiling = None;
         }
-        let queue_us = (self.srtt_us as u64).saturating_sub(self.min_rtt_us);
+        let queue_us = self
+            .recent_min_rtt_us(now_us)
+            .unwrap_or(self.srtt_us as u64)
+            .saturating_sub(self.min_rtt_us);
         // Relays and Wi-Fi jitter by tens of ms without any real queue; scale the thresholds
         // with the base round trip so a 50 ms tunnel is not mistaken for congestion.
-        let high = 30_000.max(self.min_rtt_us / 2);
-        let low = 12_000.max(self.min_rtt_us / 4);
+        let high = 25_000.max(self.min_rtt_us / 3);
+        let low = 10_000.max(self.min_rtt_us / 6);
         let blocked = self
             .blocked_since_us
             .is_some_and(|t| now_us.saturating_sub(t) > 150_000);
@@ -302,8 +320,8 @@ mod tests {
         }
         assert!(p.target_bps > 20_000_000);
         let high = p.target_bps;
-        // Queueing: round trips grow to 200 ms.
-        for id in 40..80 {
+        // Queueing: round trips grow to 200 ms and stay there (a standing queue, two seconds).
+        for id in 40..165 {
             p.on_send(id, 40_000, t);
             p.on_ack(id, t + 200_000);
             t += 16_000;
@@ -318,7 +336,7 @@ mod tests {
         assert!(p.target_bps >= p.min_bps);
         // The rate that got through is remembered: recovery approaches it carefully.
         let ceiling = p.ceiling.expect("a ceiling after congestion").0;
-        for id in 80..200 {
+        for id in 165..285 {
             p.on_send(id, 40_000, t);
             p.on_ack(id, t + 5_000);
             t += 16_000;
@@ -329,6 +347,32 @@ mod tests {
             "{} vs ceiling {ceiling}",
             p.target_bps
         );
+    }
+
+    #[test]
+    fn a_relay_that_jitters_is_not_mistaken_for_a_queue() {
+        // A public tunnel: 40 ms at best, most frames 50-70 ms, one in five up to 100 ms, and
+        // content that uses what it gets. The target must climb, not collapse.
+        let mut p = Pacer::new(2_000_000, 500_000, 50_000_000, 60);
+        let mut t = 0;
+        let mut x = 12345u32;
+        for id in 0..600 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let jitter = if x.is_multiple_of(5) {
+                30_000 + x as u64 % 30_000
+            } else {
+                x as u64 % 30_000
+            };
+            let bytes = (p.target_bps / 8 / 60) as usize;
+            p.on_send(id, bytes, t);
+            assert!(p.can_send(t + 1) || p.inflight() > 0);
+            p.on_ack(id, t + 40_000 + jitter);
+            t += 16_667;
+            p.adjust(t);
+        }
+        assert!(p.target_bps > 8_000_000, "target fell to {}", p.target_bps);
     }
 
     #[test]

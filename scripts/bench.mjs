@@ -109,15 +109,25 @@ const pids = [['server', arg('server-pid')], ['X server', arg('x-pid')]].filter(
 if (!flag('no-motion')) {
   const glass = page.evaluate(([s, mode]) => window.skylight.measureGlass({ seconds: s, mode }), [seconds, arg('motion', 'animate')]);
   await page.waitForTimeout(1500);
-  // Every decoded frame's time, for frame pacing: what the eye sees as smooth or stuttering.
+  // Every frame's decode and draw time, and every display refresh, for frame pacing: what the eye
+  // sees as smooth or stuttering.
   await page.evaluate(() => {
     const view = window.skylight;
-    const log = (view._benchFrames = []);
+    const log = (view._benchFrames = { decoded: [], drawn: [], refresh: [] });
     const sink = view._onSinkEvent.bind(view);
     view._onSinkEvent = (m) => {
-      if (m.t === 'frame' && !m.refine) log.push(m.decoded);
+      if (m.t === 'frame' && !m.refine) {
+        log.decoded.push(m.decoded);
+        log.drawn.push((m.drawn ?? m.decoded) - performance.timeOrigin);
+      }
       sink(m);
     };
+    const tick = (t) => {
+      if (view._benchFrames !== log) return;
+      log.refresh.push(t);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
   });
   const server0 = await page.evaluate(() => ({ ...window.skylight.serverStats }));
   const cpu0 = await Promise.all(pids.map(([, p]) => cpuSecs(p)));
@@ -130,7 +140,12 @@ if (!flag('no-motion')) {
   const motionSecs = (Date.now() - motionStart) / 1000;
   const cpu1 = await Promise.all(pids.map(([, p]) => cpuSecs(p)));
   const server1 = await page.evaluate(() => ({ ...window.skylight.serverStats }));
-  const decodedAt = await page.evaluate(() => window.skylight._benchFrames.splice(0));
+  const frameLog = await page.evaluate(() => {
+    const f = window.skylight._benchFrames;
+    window.skylight._benchFrames = null;
+    return f;
+  });
+  const decodedAt = frameLog.decoded;
   if (arg('screenshot')) await page.screenshot({ path: arg('screenshot') });
   result.glass = await glass;
   const iv = decodedAt.slice(1).map((t, i) => t - decodedAt[i]).sort((a, b) => a - b);
@@ -146,6 +161,31 @@ if (!flag('no-motion')) {
     skipped: (server1.skipped || 0) - (server0.skipped || 0),
     stalls: (server1.stalls || 0) - (server0.stalls || 0),
   };
+  // On screen: a refresh shows the last frame drawn before it, so of two frames drawn between the
+  // same two refreshes the first is never seen, and a refresh with none repeats the frame before.
+  {
+    const r = frameLog.refresh;
+    const drawn = frameLog.drawn.filter((t) => t >= r[0] && t < r.at(-1)).sort((a, b) => a - b);
+    let j = 0;
+    let shown = 0;
+    let repeats = 0;
+    let gap = 0;
+    for (let k = 0; k + 1 < r.length && j < drawn.length; k++) {
+      let n = 0;
+      while (j < drawn.length && drawn[j] < r[k + 1]) {
+        n++;
+        j++;
+      }
+      if (n > 0) {
+        shown++;
+        if (shown > 1) repeats += gap;
+        gap = 0;
+      } else if (shown > 0) {
+        gap++;
+      }
+    }
+    result.pacing.display = { frames: drawn.length, neverShown: drawn.length - shown, repeats, refreshes: r.length };
+  }
   result.cpu = Object.fromEntries(pids.map(([name], i) => [name, Number((((cpu1[i] - cpu0[i]) / motionSecs) * 100).toFixed(1))]));
   const avg = (k) => stats.reduce((a, s) => a + (s[k] || 0), 0) / stats.length;
   const keys = ['fps', 'kbps', 'latencyMs', 'latencyP95Ms', 'serverMs', 'queueMs', 'encodeMs', 'networkMs', 'decodeMs', 'displayMs', 'jitterMs', 'rttMs', 'targetKbps'];
@@ -162,6 +202,8 @@ if (!flag('no-motion')) {
   }
   const pc = result.pacing;
   console.log(`pacing: frame interval median ${pc.intervalMs.median.toFixed(1)} ms, p95 ${pc.intervalMs.p95.toFixed(1)}, p99 ${pc.intervalMs.p99.toFixed(1)}, max ${pc.intervalMs.max.toFixed(1)}, jitter ${pc.stdevMs.toFixed(1)} ms, ${pc.hitches} hitches, ${pc.skipped} skipped, ${pc.stalls} stalls`);
+  const ds = pc.display;
+  console.log(`screen: ${ds.neverShown} of ${ds.frames} frames never shown (two drawn in one refresh), ${ds.repeats} refreshes repeated a frame, of ${ds.refreshes}`);
   if (pids.length) console.log(`cpu:    ${pids.map(([name]) => `${name} ${result.cpu[name]}%`).join(', ')} of a core under motion`);
 } else if (arg('screenshot')) {
   await page.screenshot({ path: arg('screenshot') });

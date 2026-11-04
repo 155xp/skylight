@@ -819,7 +819,9 @@ fn encoder_loop(
     let mut cursor_pos = None;
     let mut stats = Stats::new();
     let mut payload = Vec::with_capacity(1 << 20);
-    let mut timeout = Duration::from_millis(250);
+    // No waiting before the first pass: a capture this session shares with another viewer already
+    // holds an image, and on a still screen nothing would wake the loop to send it.
+    let mut timeout = Duration::ZERO;
     let mut announced = None;
     let mut input_answered = 0u64;
     let mut last_rate_change = Instant::now();

@@ -53,6 +53,7 @@ the compositor produced the frame; `queue_us` is capture to encode start, `encod
 | `{"t":"settings","maxFps":60,"maxBitrate":8000000,"codec":"hevc"}` | Any subset. Clamped to the server's limits. |
 | `{"t":"monitor","id":"DP-1"}` | Switch displays (refused if the ticket names one). |
 | `{"t":"clipboard","text":"…"}` | Set the remote clipboard (clipboard scope). |
+| `{"t":"input-token"}` | Ask for a fresh one-time token after the input socket closed (input scope). Answered with `{"t":"input-token","token":"…"}`; it replaces the previous token, spent or not. |
 | `{"t":"bench","action":"start","mode":"click"}` | Open the latency probe window (input scope); `mode` is `move`, `click`, `key`, `animate` or `scroll`. Answered with `{"t":"bench","probe":[x,y,w,h]}` in stream pixels. `"action":"stop"` closes it. In `animate` and `scroll` modes, the top 48 rows carry a time code: 32 cells of 14×24 px, the server clock in units of 100 µs (black is a 1, most significant bit first), with the complement in the row below. |
 
 The server also sends `{"t":"clipboard","text":"…"}` when the desktop's clipboard changes,
@@ -71,7 +72,10 @@ forgets what it had in flight and sends a keyframe. A `keyframe` request does th
 ## Input socket: `/input`
 
 Opened right after `welcome`. The first message is `{"token":"<inputToken>"}` (single use). After
-that every binary message is one input event, injected as soon as it is read:
+that every binary message is one input event, injected as soon as it is read. When the socket
+closes while the session goes on (tunnels drop one now and then), the client asks for another token
+with `input-token` on the main socket and opens a new one; a session can have up to four attached
+at a time.
 
 | Type | Layout |
 |---|---|

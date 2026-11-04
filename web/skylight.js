@@ -1044,6 +1044,7 @@ export class Skylight extends EventTarget {
     this.inputWs = null;
     this._inputReady = null;
     clearTimeout(this._inputTimer);
+    clearTimeout(this._inputRetry);
     if (this._sink) this._sink.close();
     this.decoderConfig = null;
   }
@@ -1063,6 +1064,10 @@ export class Skylight extends EventTarget {
     this._lastError = null;
     this._setState('connected', m);
     this.dispatchEvent(new CustomEvent('monitors', { detail: { monitors: m.monitors, current: m.monitor } }));
+    this._lastPointer = null;
+    this._held = new Set();
+    this._lastDiscrete = 0;
+    this._inputTries = 0;
     if (m.inputToken) this._openInput(m.inputToken);
     this._ping();
     this._pingTimer = setInterval(() => this._ping(), 1000);
@@ -1074,26 +1079,24 @@ export class Skylight extends EventTarget {
     this._updateCursorMode();
   }
 
-  /** Input gets its own socket so a click never queues behind acks or control messages. */
   /**
-   * Input starts on the main socket and moves to its own socket once that is open, at a moment
-   * when nothing is pressed and no button or key has changed for a while. Two sockets do not keep
-   * order between them, so a press must never go on one and its release on the other (a lost click
-   * or a stuck button right after connecting). Through a tunnel the second socket can take a second
-   * to open; input works on the main socket meanwhile.
+   * Input gets its own socket so a click never queues behind acks or control messages. Input
+   * starts on the main socket and moves to its own socket once that is open, at a moment when
+   * nothing is pressed and no button or key has changed for a while. Two sockets do not keep order
+   * between them, so a press must never go on one and its release on the other (a lost click or a
+   * stuck button right after connecting). Through a tunnel the second socket can take a second to
+   * open, and tunnels drop one now and then; input works on the main socket meanwhile, and a socket
+   * that closes is replaced: the client asks for a fresh one-time token (`input-token`) and opens
+   * another, backing off from 200 ms to 5 s while they keep failing.
    */
-  _openInput(token, attempt = 0) {
-    if (attempt === 0) {
-      this._lastPointer = null;
-      this._held = new Set();
-      this._lastDiscrete = 0;
-    }
+  _openInput(token) {
+    const main = this.ws;
     const url = this._url.replace(/\/ws(\?.*)?$/, '/input');
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
-    let opened = false;
+    let opened = 0;
     ws.onopen = () => {
-      opened = true;
+      opened = performance.now();
       ws.send(JSON.stringify({ token }));
       this._inputReady = ws;
       this._maybeSwitchInput();
@@ -1101,8 +1104,12 @@ export class Skylight extends EventTarget {
     ws.onclose = () => {
       if (this.inputWs === ws) this.inputWs = null;
       if (this._inputReady === ws) this._inputReady = null;
-      // The token is unspent if the socket never opened; input stays on the main socket meanwhile.
-      if (!opened && attempt < 3 && this.ws) setTimeout(() => this._openInput(token, attempt + 1), 200);
+      if (!main || this.ws !== main) return; // the session itself ended
+      // One that worked for a while starts the backoff over.
+      if (opened && performance.now() - opened > 10000) this._inputTries = 0;
+      const delay = Math.min(5000, 200 * 2 ** this._inputTries++);
+      clearTimeout(this._inputRetry);
+      this._inputRetry = setTimeout(() => this.ws === main && this._send({ t: 'input-token' }), delay);
     };
   }
 
@@ -1175,6 +1182,9 @@ export class Skylight extends EventTarget {
         break;
       case 'bench':
         if (this._benchReply) this._benchReply(m);
+        break;
+      case 'input-token':
+        if (!this.inputWs && !this._inputReady) this._openInput(m.token);
         break;
       case 'error':
         this._lastError = m.message;

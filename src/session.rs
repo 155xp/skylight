@@ -66,8 +66,22 @@ pub struct InputCtx {
     /// with a cursor update; the capture watchdog relies on that.
     last_pointer_us: Arc<AtomicU64>,
     last_pointer_at: Mutex<(f32, f32)>,
+    /// Input sockets attached right now (a new one can attach while a dropped one lingers).
+    sockets: AtomicUsize,
     closed: AtomicBool,
     close: tokio::sync::Notify,
+}
+
+/// Input sockets one session may have attached at a time.
+const MAX_INPUT_SOCKETS: usize = 4;
+
+/// Counts an attached input socket for as long as it lives.
+struct Attached(Arc<InputCtx>);
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        self.0.sockets.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl InputCtx {
@@ -112,8 +126,9 @@ impl InputCtx {
     }
 }
 
-/// The input socket: authenticated by the token from `welcome`, then every message is one input
-/// event, injected the moment it arrives.
+/// The input socket: authenticated by a one-time token (from `welcome`, or a fresh one from an
+/// `input-token` request after a socket dropped), then every message is one input event, injected
+/// the moment it arrives.
 pub async fn run_input(socket: WebSocket, app: Arc<App>) {
     let (_sink, mut stream) = socket.split();
     let token = match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
@@ -125,6 +140,11 @@ pub async fn run_input(socket: WebSocket, app: Arc<App>) {
     let Some(ctx) = token.and_then(|t| app.input_tokens.lock().unwrap().remove(&t)) else {
         return;
     };
+    if ctx.sockets.fetch_add(1, Ordering::SeqCst) >= MAX_INPUT_SOCKETS {
+        ctx.sockets.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    let _attached = Attached(ctx.clone());
     loop {
         tokio::select! {
             msg = stream.next() => match msg {
@@ -304,11 +324,12 @@ async fn serve(
             last_input_us: last_input_us.clone(),
             last_pointer_us: last_pointer_us.clone(),
             last_pointer_at: Mutex::new((-1.0, -1.0)),
+            sockets: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             close: tokio::sync::Notify::new(),
         })
     });
-    let input_token = input.as_ref().map(|ctx| {
+    let mut input_token = input.as_ref().map(|ctx| {
         let t = ticket::random_id();
         app.input_tokens
             .lock()
@@ -476,6 +497,21 @@ async fn serve(
                                         }
                                     };
                                     let _ = out_tx.send(text(proto::json(&msg)));
+                                }
+                            }
+                            ClientMsg::InputToken => {
+                                // The input socket closed (tunnels drop one now and then): a
+                                // fresh token replaces the last one, spent or not, so another
+                                // socket can attach. Input travels on this socket meanwhile.
+                                if let Some(ctx) = &input {
+                                    let t = ticket::random_id();
+                                    let mut tokens = app.input_tokens.lock().unwrap();
+                                    if let Some(old) = input_token.replace(t.clone()) {
+                                        tokens.remove(&old);
+                                    }
+                                    tokens.insert(t.clone(), ctx.clone());
+                                    drop(tokens);
+                                    let _ = out_tx.send(text(proto::json(&ServerMsg::InputToken { token: &t })));
                                 }
                             }
                             ClientMsg::Hello { .. } => {}

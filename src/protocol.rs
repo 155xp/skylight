@@ -205,6 +205,9 @@ pub enum ClientMsg {
         #[serde(default)]
         mode: Option<String>,
     },
+    /// A fresh one-time token for another input socket, after the last one closed.
+    #[serde(rename = "input-token")]
+    InputToken,
 }
 
 /// First message on the input socket.
@@ -250,6 +253,10 @@ pub enum ServerMsg<'a> {
     Bench {
         probe: Option<[u32; 4]>,
         error: Option<String>,
+    },
+    #[serde(rename = "input-token")]
+    InputToken {
+        token: &'a str,
     },
     Error {
         message: &'a str,
@@ -314,6 +321,16 @@ mod tests {
         assert_eq!(u16::from_le_bytes(m[8..10].try_into().unwrap()), 1920);
         assert_eq!(u64::from_le_bytes(m[12..20].try_into().unwrap()), 99);
         assert_eq!(m[28], 0xaa);
+    }
+
+    #[test]
+    fn input_token_messages() {
+        let m: ClientMsg = serde_json::from_str(r#"{"t":"input-token"}"#).unwrap();
+        assert!(matches!(m, ClientMsg::InputToken));
+        assert_eq!(
+            json(&ServerMsg::InputToken { token: "abc" }),
+            r#"{"t":"input-token","token":"abc"}"#
+        );
     }
 
     #[test]

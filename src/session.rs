@@ -665,7 +665,7 @@ async fn start_probe(
 ) -> anyhow::Result<(tokio::process::Child, [u32; 4])> {
     use tokio::io::AsyncBufReadExt;
     let size = match mode {
-        probe::Mode::Animate => 480u32,
+        probe::Mode::Animate | probe::Mode::Follow => 480u32,
         probe::Mode::Scroll | probe::Mode::Page => 960,
         _ => 160,
     };
@@ -677,6 +677,7 @@ async fn start_probe(
         probe::Mode::Animate => "animate",
         probe::Mode::Scroll => "scroll",
         probe::Mode::Page => "page",
+        probe::Mode::Follow => "follow",
     };
     let mut cmd = tokio::process::Command::new(exe);
     cmd.args([

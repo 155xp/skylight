@@ -31,6 +31,9 @@ pub enum Mode {
     /// A large window of text and grey panels that turns to a new page on each click, then stays
     /// still: every click changes all of it at once, for image quality tests.
     Page,
+    /// A square that follows the pointer, redrawn (with the time code) on every move and only
+    /// then: motion that comes from input, like dragging or scrolling, for smoothness tests.
+    Follow,
 }
 
 impl Mode {
@@ -42,6 +45,7 @@ impl Mode {
             "animate" => Some(Mode::Animate),
             "scroll" => Some(Mode::Scroll),
             "page" => Some(Mode::Page),
+            "follow" => Some(Mode::Follow),
             _ => None,
         }
     }
@@ -138,7 +142,7 @@ pub fn run(x: i32, y: i32, size: u16, mode: Mode) -> Result<()> {
         AtomEnum::ATOM,
         &[above, skip],
     )?;
-    if matches!(mode, Mode::Animate | Mode::Scroll) {
+    if matches!(mode, Mode::Animate | Mode::Scroll | Mode::Follow) {
         // Nothing to type into: never take keyboard focus from whatever the user is doing (no
         // input hint, and a zero user time tells the window manager not to activate it on map).
         conn.change_property32(
@@ -230,6 +234,52 @@ pub fn run(x: i32, y: i32, size: u16, mode: Mode) -> Result<()> {
         Ok(())
     };
 
+    // The server clock's zero on CLOCK_MONOTONIC, so the time code is in the server's clock.
+    let origin_ns: u64 = std::env::var("SKYLIGHT_CLOCK_ORIGIN_NS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    // The time code along the top (see `TIMECODE_BITS`): the moment of this redraw.
+    let stamp = || -> Result<()> {
+        let code = (crate::clock::monotonic_ns().saturating_sub(origin_ns) / 100_000) as u32;
+        let mut ones = Vec::new();
+        let mut zeros = Vec::new();
+        for bit in 0..TIMECODE_BITS {
+            let x = (bit as u16 * TIMECODE_CELL) as i16;
+            let set = code >> (TIMECODE_BITS - 1 - bit) & 1 == 1;
+            let cell = |row: u16| Rectangle {
+                x,
+                y: (row * TIMECODE_ROW) as i16,
+                width: TIMECODE_CELL,
+                height: TIMECODE_ROW,
+            };
+            ones.push(cell(if set { 0 } else { 1 }));
+            zeros.push(cell(if set { 1 } else { 0 }));
+        }
+        conn.change_gc(gc, &ChangeGCAux::new().foreground(white))?;
+        conn.poly_fill_rectangle(win, gc, &zeros)?;
+        conn.change_gc(gc, &ChangeGCAux::new().foreground(black))?;
+        conn.poly_fill_rectangle(win, gc, &ones)?;
+        Ok(())
+    };
+    // The follow probe: grey, with a black square under the pointer and the time code.
+    let follow = |x: i16, y: i16| -> Result<()> {
+        fill(0x808080)?;
+        conn.poly_fill_rectangle(
+            win,
+            gc,
+            &[Rectangle {
+                x: x - 20,
+                y: y - 20,
+                width: 40,
+                height: 40,
+            }],
+        )?;
+        stamp()?;
+        conn.flush()?;
+        Ok(())
+    };
+
     // white / black for move and click; blank / glyph page for key; the page number for page.
     let mut dark = false;
     let mut page = 0u32;
@@ -248,11 +298,6 @@ pub fn run(x: i32, y: i32, size: u16, mode: Mode) -> Result<()> {
         // Sweep a black bar across a shifting grey, as fast as the X server takes it; the
         // compositor turns that into one new frame per display refresh.
         let start = std::time::Instant::now();
-        // The server clock's zero on CLOCK_MONOTONIC, so the time code is in the server's clock.
-        let origin_ns: u64 = std::env::var("SKYLIGHT_CLOCK_ORIGIN_NS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
         loop {
             while conn.poll_for_event()?.is_some() {}
             let t = start.elapsed().as_secs_f64();
@@ -286,25 +331,7 @@ pub fn run(x: i32, y: i32, size: u16, mode: Mode) -> Result<()> {
                     }],
                 )?;
             }
-            let code = (crate::clock::monotonic_ns().saturating_sub(origin_ns) / 100_000) as u32;
-            let mut ones = Vec::new();
-            let mut zeros = Vec::new();
-            for bit in 0..TIMECODE_BITS {
-                let x = (bit as u16 * TIMECODE_CELL) as i16;
-                let set = code >> (TIMECODE_BITS - 1 - bit) & 1 == 1;
-                let cell = |row: u16| Rectangle {
-                    x,
-                    y: (row * TIMECODE_ROW) as i16,
-                    width: TIMECODE_CELL,
-                    height: TIMECODE_ROW,
-                };
-                ones.push(cell(if set { 0 } else { 1 }));
-                zeros.push(cell(if set { 1 } else { 0 }));
-            }
-            conn.change_gc(gc, &ChangeGCAux::new().foreground(white))?;
-            conn.poly_fill_rectangle(win, gc, &zeros)?;
-            conn.change_gc(gc, &ChangeGCAux::new().foreground(black))?;
-            conn.poly_fill_rectangle(win, gc, &ones)?;
+            stamp()?;
             conn.flush()?;
             if !reported && start.elapsed() > std::time::Duration::from_millis(250) {
                 let pos = conn.translate_coordinates(win, root, 0, 0)?.reply()?;
@@ -342,6 +369,8 @@ pub fn run(x: i32, y: i32, size: u16, mode: Mode) -> Result<()> {
             Event::Expose(_) => {
                 if mode == Mode::Page {
                     draw_page(page)?;
+                } else if mode == Mode::Follow {
+                    follow(size as i16 / 2, size as i16 / 2)?;
                 } else {
                     redraw(dark, glyph)?;
                 }
@@ -355,6 +384,17 @@ pub fn run(x: i32, y: i32, size: u16, mode: Mode) -> Result<()> {
                     std::io::stdout().flush()?;
                     reported = true;
                 }
+            }
+            Event::MotionNotify(e) if mode == Mode::Follow => {
+                // Draw where the pointer is now, as an app does: moves that queued up meanwhile
+                // count only for their last position.
+                let mut at = (e.event_x, e.event_y);
+                while let Some(ev) = conn.poll_for_event()? {
+                    if let Event::MotionNotify(m) = ev {
+                        at = (m.event_x, m.event_y);
+                    }
+                }
+                follow(at.0, at.1)?;
             }
             Event::MotionNotify(e) if mode == Mode::Move => {
                 let want = (e.event_x as i32) >= size as i32 / 2;

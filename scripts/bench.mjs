@@ -10,6 +10,8 @@
 //   * click-to-update, keypress-to-glyph and pointer-move latency through the probe window
 //   * frame rate, bitrate and the capture-to-display breakdown while the probe animates, and
 //     glass to glass: the probe stamps each redraw with a time code that is read back from the video
+//     (--motion animate, scroll, or follow: a square that follows the pointer, which the bench
+//     moves in circles, like dragging)
 //   * frame pacing under motion: the spread of the intervals between decoded frames, hitches (a
 //     gap of more than two intervals) and the frames the server's pacer skipped
 //   * with --server-pid (and --x-pid for the X server it captures), CPU use under motion, and
@@ -107,6 +109,19 @@ const cpuSecs = async (pid) => {
 const pids = [['server', arg('server-pid')], ['X server', arg('x-pid')]].filter(([, p]) => p);
 
 if (!flag('no-motion')) {
+  if (arg('motion') === 'follow') {
+    // The follow probe moves only when the pointer does, as a drag or a scroll does: drive the
+    // pointer in circles over it, one turn a second at a mouse's 250 updates a second, all run.
+    const rect = await page.evaluate(() => window.skylight.showProbe('follow'));
+    await page.evaluate(([px, py, pw, ph]) => {
+      const view = window.skylight;
+      const t0 = performance.now();
+      view._benchDrive = setInterval(() => {
+        const a = ((performance.now() - t0) / 1000) * 2 * Math.PI;
+        view._pointer(px + pw / 2 + Math.cos(a) * pw * 0.3, py + ph / 2 + Math.sin(a) * ph * 0.3);
+      }, 4);
+    }, rect);
+  }
   const glass = page.evaluate(([s, mode]) => window.skylight.measureGlass({ seconds: s, mode }), [seconds, arg('motion', 'animate')]);
   await page.waitForTimeout(1500);
   // Every frame's decode and draw time, and every display refresh, for frame pacing: what the eye
@@ -150,6 +165,7 @@ if (!flag('no-motion')) {
   const decodedAt = frameLog.decoded;
   if (arg('screenshot')) await page.screenshot({ path: arg('screenshot') });
   result.glass = await glass;
+  await page.evaluate(() => clearInterval(window.skylight._benchDrive));
   const iv = decodedAt.slice(1).map((t, i) => t - decodedAt[i]).sort((a, b) => a - b);
   const q = (p) => (iv.length ? iv[Math.min(iv.length - 1, Math.round((iv.length - 1) * p))] : 0);
   const mean = iv.reduce((a, b) => a + b, 0) / Math.max(1, iv.length);

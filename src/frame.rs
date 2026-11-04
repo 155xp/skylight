@@ -636,7 +636,10 @@ mod tests {
         let px = |x: usize, y: usize| mine[(y * 10 + x) * 4];
         assert_eq!(px(4, 5), 8);
         assert_eq!((px(5, 5), px(6, 6)), (7, 7));
-        assert_eq!((px(3, 5), px(7, 5), px(4, 4), px(4, 7), px(0, 0)), (1, 1, 1, 1, 1));
+        assert_eq!(
+            (px(3, 5), px(7, 5), px(4, 4), px(4, 7), px(0, 0)),
+            (1, 1, 1, 1, 1)
+        );
     }
 
     #[test]

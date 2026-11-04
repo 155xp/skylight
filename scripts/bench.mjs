@@ -4,7 +4,7 @@
 //                          [--key ~/.config/skylight/ticket-private.pem] [--aud <hostname>]
 //                          [--screenshot out.png] [--json out.json] [--headed]
 //                          [--modes click,key,move] [--no-motion] [--server-pid N] [--x-pid N]
-//                          [--idle 10] [--connects N]
+//                          [--idle 10] [--connects N] [--quality N] [--mbps M]
 //
 // It mints a ticket, opens the viewer, then measures:
 //   * click-to-update, keypress-to-glyph and pointer-move latency through the probe window
@@ -14,6 +14,9 @@
 //     gap of more than two intervals) and the frames the server's pacer skipped
 //   * with --server-pid (and --x-pid for the X server it captures), CPU use under motion, and
 //     the server's CPU and what reaches the browser while the screen is still
+//   * with --quality N, N changes of a page of text: what the browser shows against the server's
+//     own picture of it (luma PSNR), right after the change and once it has settled, and what the
+//     change cost; --mbps caps the bitrate so such runs compare at the same budget
 //   * with --connects N, N fresh connections: time to the welcome and to the first frame, and
 //     from a dropped socket to the first frame after the client reconnects on its own
 import { chromium } from 'playwright-core';
@@ -57,6 +60,11 @@ for (let attempt = 1; ; attempt++) {
 await page.waitForFunction(() => window.skylight && window.skylight.state === 'connected', null, { timeout: 15000 });
 const connectMs = Date.now() - t0;
 await page.waitForFunction(() => window.skylight.width > 0, null, { timeout: 10000 });
+if (arg('mbps')) {
+  // A fixed bitrate cap (Mbit/s) instead of whatever the controller has reached, for comparisons
+  // that depend on the budget, such as image quality.
+  await page.evaluate((b) => window.skylight.setOptions({ maxBitrate: b }), Number(arg('mbps')) * 1e6);
+}
 await page.waitForTimeout(1500);
 if (arg('jank')) {
   // A busy page: block the page's thread for N ms out of every 50 (heavy layout, charts, GC).
@@ -175,6 +183,86 @@ if (arg('server-pid')) {
     bytesPerSec: Number(((rx1.bytes - rx0.bytes) / secs).toFixed(1)),
   };
   console.log(`idle:   server CPU ${result.idle.serverCpuPercent}% of a core, ${result.idle.messagesPerSec} messages/s, ${result.idle.bytesPerSec} B/s to the browser`);
+}
+
+if (Number(arg('quality', 0)) > 0) {
+  // Image quality per bit. The page probe turns to a new page of text and grey panels on each
+  // click (the whole 960 px window changes at once) and then stays still. For each change, the
+  // decoded frames are compared with the server's own picture of the settled screen
+  // (/api/screenshot): luma PSNR of the first frame of the new page, which the encoder had to fit
+  // under its cap, and of the last one, after the refinement frames; and what the change cost.
+  const key = loadPrivateKey(keyPath);
+  await page.exposeFunction('benchViewTicket', () => mintTicket(key, { aud, sub: 'bench', scope: ['view'] }));
+  const runs = await page.evaluate(async (pages) => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const view = window.skylight;
+    const [px, py, pw, ph] = await view.showProbe('page');
+    const canvas = new OffscreenCanvas(view.width, view.height);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const lumaOf = (img) => {
+      ctx.drawImage(img, 0, 0, view.width, view.height);
+      const d = ctx.getImageData(px, py, pw, ph).data;
+      const y = new Float32Array(pw * ph);
+      for (let i = 0; i < y.length; i++) y[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+      return y;
+    };
+    const psnr = (a, b) => {
+      let se = 0;
+      for (let i = 0; i < a.length; i++) se += (a[i] - b[i]) ** 2;
+      return se === 0 ? 99 : 10 * Math.log10((255 * 255 * a.length) / se);
+    };
+    const screenshot = async () => {
+      const r = await fetch(new URL('api/screenshot', location.href), { headers: { Authorization: `Bearer ${await window.benchViewTicket()}` } });
+      return lumaOf(await createImageBitmap(await r.blob()));
+    };
+    let frames = null;
+    const sink = view._onSinkEvent.bind(view);
+    view._onSinkEvent = (m) => {
+      if (m.t === 'vframe' && frames) frames.push({ at: performance.now(), luma: lumaOf(m.frame), bytes: m.meta ? m.meta.bytes : 0 });
+      sink(m);
+    };
+    view._watchFrames(true);
+    await sleep(1500);
+    let before = await screenshot();
+    const out = [];
+    for (let n = 0; n < pages; n++) {
+      frames = [];
+      view._pointer(px + pw / 2, py + ph / 2);
+      view._button(0, true);
+      view._button(0, false);
+      // Settled: nothing new for 800 ms (the refinements come 120 ms after the change, one per
+      // round trip).
+      const start = performance.now();
+      while (performance.now() - start < 8000) {
+        await sleep(100);
+        if (frames.length && performance.now() - frames.at(-1).at > 800) break;
+      }
+      const got = frames;
+      frames = null;
+      const after = await screenshot();
+      // The first frame of the new page is the first closer to it than to the old one.
+      const i = got.findIndex((f) => psnr(f.luma, after) > psnr(f.luma, before));
+      if (i >= 0) {
+        const page = got.slice(i);
+        out.push({
+          firstDb: psnr(page[0].luma, after),
+          settledDb: psnr(page.at(-1).luma, after),
+          firstKB: page[0].bytes / 1000,
+          totalKB: page.reduce((a, f) => a + f.bytes, 0) / 1000,
+          frames: page.length,
+          settleMs: page.at(-1).at - page[0].at,
+        });
+      }
+      before = after;
+      await sleep(300);
+    }
+    view._watchFrames(false);
+    await view.showProbe(null);
+    return out;
+  }, Number(arg('quality')));
+  const med = (k) => runs.map((r) => r[k]).sort((a, b) => a - b)[Math.floor(runs.length / 2)] ?? 0;
+  result.quality = { runs, median: Object.fromEntries(['firstDb', 'settledDb', 'firstKB', 'totalKB', 'frames', 'settleMs'].map((k) => [k, med(k)])) };
+  console.log(`quality: a page change shows at ${med('firstDb').toFixed(1)} dB (${med('firstKB').toFixed(0)} kB), settles at ${med('settledDb').toFixed(1)} dB after ${med('frames') - 1} refinement frame(s) in ${med('settleMs').toFixed(0)} ms, ${med('totalKB').toFixed(0)} kB in all; medians of ${runs.length} changes`);
 }
 
 if (Number(arg('connects', 0)) > 0) {

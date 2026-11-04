@@ -654,7 +654,7 @@ async fn start_probe(
     use tokio::io::AsyncBufReadExt;
     let size = match mode {
         probe::Mode::Animate => 480u32,
-        probe::Mode::Scroll => 960,
+        probe::Mode::Scroll | probe::Mode::Page => 960,
         _ => 160,
     };
     let exe = std::env::current_exe()?;
@@ -664,6 +664,7 @@ async fn start_probe(
         probe::Mode::Key => "key",
         probe::Mode::Animate => "animate",
         probe::Mode::Scroll => "scroll",
+        probe::Mode::Page => "page",
     };
     let mut cmd = tokio::process::Command::new(exe);
     cmd.args([

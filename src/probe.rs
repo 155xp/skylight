@@ -28,6 +28,9 @@ pub enum Mode {
     /// Like `Animate`, but a large window of text scrolling smoothly, the way a terminal or a web
     /// page scrolls: much more detail per frame, for bandwidth and slow-link tests.
     Scroll,
+    /// A large window of text and grey panels that turns to a new page on each click, then stays
+    /// still: every click changes all of it at once, for image quality tests.
+    Page,
 }
 
 impl Mode {
@@ -38,6 +41,7 @@ impl Mode {
             "key" => Some(Mode::Key),
             "animate" => Some(Mode::Animate),
             "scroll" => Some(Mode::Scroll),
+            "page" => Some(Mode::Page),
             _ => None,
         }
     }
@@ -49,6 +53,21 @@ impl Mode {
 pub const TIMECODE_BITS: u32 = 32;
 pub const TIMECODE_CELL: u16 = 14;
 pub const TIMECODE_ROW: u16 = 24;
+
+/// Line `i` of the text the scroll and page probes draw: printable characters and spaces that
+/// depend on the line's index, so no two lines repeat.
+fn text_line(i: i64, cols: usize) -> Vec<u8> {
+    (0..cols)
+        .map(|c| {
+            let h = (i as usize).wrapping_mul(2654435761) ^ c.wrapping_mul(40503);
+            if (h >> 7).is_multiple_of(6) {
+                b' '
+            } else {
+                b'!' + ((h >> 3) % 90) as u8
+            }
+        })
+        .collect()
+}
 
 fn atom(conn: &impl Connection, name: &str) -> Result<Atom> {
     Ok(conn.intern_atom(false, name.as_bytes())?.reply()?.atom)
@@ -174,8 +193,46 @@ pub fn run(x: i32, y: i32, size: u16, mode: Mode) -> Result<()> {
         Ok(())
     };
 
-    // white / black for move and click; blank / glyph page for key.
+    // Page `n` for the page probe: text, then grey panels over it in places that depend on `n`.
+    let draw_page = |n: u32| -> Result<()> {
+        fill(white)?;
+        let mut row = 18i16;
+        let mut i = n as i64 * 1000;
+        while row < size as i16 {
+            conn.image_text8(win, gc, 2, row, &text_line(i, size as usize / 10))?;
+            row += 20;
+            i += 1;
+        }
+        let mut x = n.wrapping_mul(2654435761) | 1;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for _ in 0..6 {
+            let shade = [0xe8u32, 0xc8, 0x98, 0x58][(next() % 4) as usize];
+            let (w, h) = (60 + next() % 300, 40 + next() % 200);
+            let panel = Rectangle {
+                x: (next() % (size as u32 - w)) as i16,
+                y: (next() % (size as u32 - h)) as i16,
+                width: w as u16,
+                height: h as u16,
+            };
+            conn.change_gc(
+                gc,
+                &ChangeGCAux::new().foreground((shade << 16) | (shade << 8) | shade),
+            )?;
+            conn.poly_fill_rectangle(win, gc, &[panel])?;
+        }
+        conn.change_gc(gc, &ChangeGCAux::new().foreground(black))?;
+        conn.flush()?;
+        Ok(())
+    };
+
+    // white / black for move and click; blank / glyph page for key; the page number for page.
     let mut dark = false;
+    let mut page = 0u32;
     let mut glyph: u8 = b'k';
     let mut reported = false;
     let redraw = |dark: bool, glyph: u8| -> Result<()> {
@@ -208,16 +265,7 @@ pub fn run(x: i32, y: i32, size: u16, mode: Mode) -> Result<()> {
                 let mut row = 48 + 18 - (pos % 20) as i16;
                 let mut i = first;
                 while row < size as i16 + 20 {
-                    let line: Vec<u8> = (0..(size as usize / 10))
-                        .map(|c| {
-                            let h = (i as usize).wrapping_mul(2654435761) ^ c.wrapping_mul(40503);
-                            if (h >> 7).is_multiple_of(6) {
-                                b' '
-                            } else {
-                                b'!' + ((h >> 3) % 90) as u8
-                            }
-                        })
-                        .collect();
+                    let line = text_line(i, size as usize / 10);
                     conn.image_text8(win, gc, 2, row, &line)?;
                     row += 20;
                     i += 1;
@@ -292,7 +340,11 @@ pub fn run(x: i32, y: i32, size: u16, mode: Mode) -> Result<()> {
         }
         match event {
             Event::Expose(_) => {
-                redraw(dark, glyph)?;
+                if mode == Mode::Page {
+                    draw_page(page)?;
+                } else {
+                    redraw(dark, glyph)?;
+                }
                 if !reported {
                     // Tell the caller where the window really landed. The first expose can come
                     // before the window manager has moved it into place, so give it a moment.
@@ -314,6 +366,10 @@ pub fn run(x: i32, y: i32, size: u16, mode: Mode) -> Result<()> {
             Event::ButtonPress(e) if mode == Mode::Click && e.detail == 1 => {
                 dark = !dark;
                 redraw(dark, glyph)?;
+            }
+            Event::ButtonPress(e) if mode == Mode::Page && e.detail == 1 => {
+                page += 1;
+                draw_page(page)?;
             }
             Event::KeyPress(e) if mode == Mode::Key => {
                 // Any key: draw a page of a letter that depends on the keycode.

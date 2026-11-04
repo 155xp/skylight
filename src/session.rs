@@ -43,6 +43,12 @@ pub struct Config {
 
 const MAX_UNAUTHENTICATED: usize = 32;
 
+/// A viewer pings every second, so this much silence means the connection is gone without having
+/// closed (a tunnel or NAT that stopped forwarding). Through a tunnel or a proxy the server's TCP
+/// peer is a local process, so TCP itself never notices. Generous, because a background tab's
+/// timers may run only once a minute.
+const SILENT_VIEWER: Duration = Duration::from_secs(90);
+
 pub struct App {
     pub hub: Hub,
     pub verifier: Verifier,
@@ -408,6 +414,7 @@ async fn serve(
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs(expires.saturating_sub(clock::unix_secs()));
     let mut last_keyframe_req = Instant::now() - Duration::from_secs(1);
+    let mut heard = tokio::time::Instant::now();
 
     let res: anyhow::Result<()> = loop {
         tokio::select! {
@@ -416,6 +423,7 @@ async fn serve(
                     Some(Ok(m)) => m,
                     _ => break Ok(()),
                 };
+                heard = tokio::time::Instant::now();
                 match msg {
                     Message::Binary(b) => {
                         let Some(inp) = proto::parse_input(&b) else { continue };
@@ -534,6 +542,10 @@ async fn serve(
             _ = tokio::time::sleep_until(deadline) => {
                 let _ = out_tx.send(text(proto::json(&ServerMsg::Error { message: "session expired" })));
                 break Ok(());
+            }
+            _ = tokio::time::sleep_until(heard + SILENT_VIEWER) => {
+                // Its slot, its encoder and its capture are needed by whoever reconnects.
+                break Err(anyhow::anyhow!("the viewer went silent"));
             }
         }
     };

@@ -180,6 +180,9 @@ pub enum ClientMsg {
         monitor: Option<String>,
         #[serde(default, rename = "maxBitrate")]
         max_bitrate: Option<u64>,
+        /// What the client's last session on this path settled at (see `Pacer::new`'s start).
+        #[serde(default, rename = "startBitrate")]
+        start_bitrate: Option<u64>,
     },
     Ping {
         id: u64,
@@ -342,6 +345,16 @@ mod tests {
             m,
             ClientMsg::Hello {
                 max_fps: Some(120),
+                start_bitrate: None,
+                ..
+            }
+        ));
+        let m: ClientMsg =
+            serde_json::from_str(r#"{"t":"hello","ticket":"x","startBitrate":1500000}"#).unwrap();
+        assert!(matches!(
+            m,
+            ClientMsg::Hello {
+                start_bitrate: Some(1_500_000),
                 ..
             }
         ));

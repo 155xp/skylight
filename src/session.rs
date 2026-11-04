@@ -281,6 +281,7 @@ pub async fn run(socket: WebSocket, app: Arc<App>) {
         max_fps,
         monitor,
         max_bitrate,
+        start_bitrate,
     }) = hello
     else {
         let _ = sink
@@ -312,7 +313,7 @@ pub async fn run(socket: WebSocket, app: Arc<App>) {
         return;
     }
     let session_id = ticket::random_id()[..8].to_string();
-    tracing::info!(session = %session_id, sub = %claims.sub, scope = ?claims.scope, "session start");
+    tracing::info!(session = %session_id, sub = %claims.sub, scope = ?claims.scope, start_kbps = ?start_bitrate.map(|b| b / 1000), "session start");
     let started = Instant::now();
     let result = serve(
         &app,
@@ -324,6 +325,7 @@ pub async fn run(socket: WebSocket, app: Arc<App>) {
         max_fps,
         monitor,
         max_bitrate,
+        start_bitrate,
     )
     .await;
     app.sessions.fetch_sub(1, Ordering::SeqCst);
@@ -352,6 +354,7 @@ async fn serve(
     max_fps: Option<u32>,
     monitor: Option<String>,
     max_bitrate: Option<u64>,
+    start_bitrate: Option<u64>,
 ) -> anyhow::Result<()> {
     let wanted_mon = claims.mon.clone().or(monitor);
     let mut mon = app.hub.resolve(wanted_mon.as_deref())?;
@@ -426,8 +429,12 @@ async fn serve(
     let shared = Arc::new(Shared {
         sig: Signal::new(),
         cmds: Mutex::new(VecDeque::new()),
+        // A client that reconnects says what its last session on this path settled at, so the
+        // first keyframe of the new one fits the path: at the default start, a forced keyframe
+        // may be 400 kB, seconds of a slow VPN path, and one WebSocket message the client sees
+        // nothing of until it has all arrived. Only ever lower than the default.
         pacer: Mutex::new(Pacer::new(
-            app.config.start_bitrate,
+            start_bitrate.map_or(app.config.start_bitrate, |b| b.min(app.config.start_bitrate)),
             app.config.min_bitrate,
             max_bps,
             fps,

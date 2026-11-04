@@ -66,8 +66,10 @@ pub struct InputCtx {
     sink: Arc<dyn InputSink>,
     mon: Mutex<MonitorInfo>,
     held: Mutex<HeldKeys>,
-    /// Server clock of the last input event; the encoder skips its frame-rate cap right after.
+    /// Server clock of the last input event (refinement waits for a pause in input).
     last_input_us: Arc<AtomicU64>,
+    /// What kind of input came when, for the encoder's pacing.
+    times: Arc<InputTimes>,
     /// Server clock of the last pointer move to a new spot, which the compositor has to answer
     /// with a cursor update; the capture watchdog relies on that.
     last_pointer_us: Arc<AtomicU64>,
@@ -80,6 +82,45 @@ pub struct InputCtx {
 
 /// Input sockets one session may have attached at a time.
 const MAX_INPUT_SOCKETS: usize = 4;
+
+/// When input arrived (server clock, µs), by kind, for the encoder's pacing (see
+/// `INPUT_FAST_PATH_US`).
+#[derive(Default)]
+struct InputTimes {
+    /// The last click, key press or touch.
+    discrete_us: AtomicU64,
+    /// When the current run of pointer motion or scrolling began, after a pause of at least
+    /// `MOTION_PAUSE_US`, and its latest event.
+    burst_us: AtomicU64,
+    motion_us: AtomicU64,
+}
+
+/// Pointer motion or scrolling after this long without any starts a new run.
+const MOTION_PAUSE_US: u64 = 50_000;
+
+impl InputTimes {
+    fn record(&self, batch: &[Input], now: u64) {
+        let discrete = batch.iter().any(|i| match i {
+            Input::Button { .. } | Input::Key { .. } | Input::Text(_) => true,
+            Input::Touch { kind, .. } => *kind != capture::TouchKind::Move,
+            _ => false,
+        });
+        let motion = batch.iter().any(|i| match i {
+            Input::PointerAbs { .. } | Input::PointerRel { .. } | Input::Scroll { .. } => true,
+            Input::Touch { kind, .. } => *kind == capture::TouchKind::Move,
+            _ => false,
+        });
+        if discrete {
+            self.discrete_us.store(now, Ordering::Relaxed);
+        }
+        if motion {
+            let last = self.motion_us.swap(now, Ordering::Relaxed);
+            if now.saturating_sub(last) >= MOTION_PAUSE_US {
+                self.burst_us.store(now, Ordering::Relaxed);
+            }
+        }
+    }
+}
 
 /// Counts an attached input socket for as long as it lives.
 struct Attached(Arc<InputCtx>);
@@ -100,6 +141,7 @@ impl InputCtx {
     fn handle_batch(&self, batch: Vec<Input>) {
         let now = clock::now_us();
         self.last_input_us.store(now, Ordering::Relaxed);
+        self.times.record(&batch, now);
         if let Some(&Input::PointerAbs { x, y }) = batch
             .iter()
             .rev()
@@ -322,12 +364,14 @@ async fn serve(
     };
     let last_input_us = Arc::new(AtomicU64::new(0));
     let last_pointer_us = Arc::new(AtomicU64::new(0));
+    let input_times = Arc::new(InputTimes::default());
     let input = input_sink.map(|sink| {
         Arc::new(InputCtx {
             sink,
             mon: Mutex::new(mon.clone()),
             held: Mutex::new(HeldKeys::default()),
             last_input_us: last_input_us.clone(),
+            times: input_times.clone(),
             last_pointer_us: last_pointer_us.clone(),
             last_pointer_at: Mutex::new((-1.0, -1.0)),
             sockets: AtomicUsize::new(0),
@@ -398,6 +442,7 @@ async fn serve(
         let ctx = EncoderCtx {
             input: input.clone(),
             last_input_us,
+            input_times,
             last_pointer_us,
         };
         std::thread::Builder::new()
@@ -795,7 +840,12 @@ impl Stats {
 }
 
 /// For this long after any input, frames go out as soon as they exist, ignoring the frame-rate
-/// cap, so the frame that answers a click or key press never waits for a pacing slot.
+/// cap, so the frame that answers a click or key press never waits for a pacing slot. Far away
+/// (a tunnel, the internet) that holds after a click, a key press or a touch, and for the first
+/// frame of a run of pointer motion or scrolling; the rest of a drag or a scroll goes at the frame
+/// rate, which is the display's own. Faster, over a jittery path, most of those frames are never
+/// seen, the pacer has to skip, and the ones that do show land unevenly. On a LAN they cost little
+/// and keep the newest picture a few milliseconds fresher.
 const INPUT_FAST_PATH_US: u64 = 250_000;
 
 /// A viewer whose best round trip is longer than this is on a long path (`remote_max_fps`).
@@ -805,6 +855,7 @@ const REMOTE_RTT_US: u64 = 20_000;
 struct EncoderCtx {
     input: Option<Arc<InputCtx>>,
     last_input_us: Arc<AtomicU64>,
+    input_times: Arc<InputTimes>,
     last_pointer_us: Arc<AtomicU64>,
 }
 
@@ -869,6 +920,8 @@ fn encoder_loop(
     let mut need_key = true;
     let mut last_encode = Instant::now() - Duration::from_secs(1);
     let mut last_content = Instant::now();
+    // Capture time (server clock) of the last frame of new content that went out.
+    let mut last_capture_us = 0u64;
     let mut refine_left = 0u8;
     let mut cursor_serial = u32::MAX;
     let mut cursor_pos = None;
@@ -1083,8 +1136,6 @@ fn encoder_loop(
             }
             continue;
         }
-        let recent_input =
-            now_us.saturating_sub(last_input_us.load(Ordering::Relaxed)) < INPUT_FAST_PATH_US;
         // Far away (a tunnel, the internet), frames arrive with the path's jitter: past
         // `remote_max_fps` more of them only make the motion less even and cost bytes.
         let (path_fps, remote) = {
@@ -1099,10 +1150,18 @@ fn encoder_loop(
             (f, remote)
         };
         let frame_us = 1_000_000 / path_fps.max(1) as u64;
-        // Right after input the frame that answers it goes at once. Far away that is at most every
-        // half frame: while the mouse keeps moving, every compositor frame (144 a second on a fast
-        // monitor) would otherwise go out, unevenly.
-        let interval = if recent_input && (new_content || pending) {
+        let since_input = |t: &AtomicU64| now_us.saturating_sub(t.load(Ordering::Relaxed));
+        let times = &*ctx.input_times;
+        let answering = if remote {
+            since_input(&times.discrete_us) < INPUT_FAST_PATH_US
+                || times.burst_us.load(Ordering::Relaxed) > last_capture_us
+        } else {
+            since_input(last_input_us) < INPUT_FAST_PATH_US
+        };
+        // The frame that answers input goes at once (see `INPUT_FAST_PATH_US`). Far away that is at
+        // most every half frame: after a click while the mouse keeps moving, every compositor frame
+        // (144 a second on a fast monitor) would otherwise go out, unevenly.
+        let interval = if answering && (new_content || pending) {
             Duration::from_micros(if remote { frame_us / 2 } else { 0 })
         } else {
             Duration::from_micros(frame_us)
@@ -1266,6 +1325,7 @@ fn encoder_loop(
         } else {
             refine_left = steps.len() as u8;
             last_content = Instant::now();
+            last_capture_us = r.capture_us;
             timeout = REFINE_AFTER;
         }
         need_key = false;
@@ -1397,6 +1457,39 @@ fn send_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drag_is_one_run_of_motion_and_a_click_always_counts() {
+        let t = InputTimes::default();
+        let mv = |x: f32| Input::PointerAbs { x, y: 0.0 };
+        // A mouse moving at 250 Hz: one run, from its first event.
+        for i in 0..50u64 {
+            t.record(&[mv(i as f32)], 1_000_000 + i * 4_000);
+        }
+        assert_eq!(t.burst_us.load(Ordering::Relaxed), 1_000_000);
+        assert_eq!(t.discrete_us.load(Ordering::Relaxed), 0);
+        // A click in the middle of it is a click.
+        let click = Input::Button {
+            button: 0,
+            down: true,
+        };
+        t.record(&[mv(1.0), click], 1_200_000);
+        assert_eq!(t.discrete_us.load(Ordering::Relaxed), 1_200_000);
+        assert_eq!(t.burst_us.load(Ordering::Relaxed), 1_000_000);
+        // Motion after a pause starts a new run; so does a finger moving on a touch screen.
+        t.record(&[mv(2.0)], 1_300_000);
+        assert_eq!(t.burst_us.load(Ordering::Relaxed), 1_300_000);
+        let touch = |kind| Input::Touch {
+            kind,
+            id: 0,
+            x: 0.0,
+            y: 0.0,
+        };
+        t.record(&[touch(capture::TouchKind::Down)], 1_400_000);
+        assert_eq!(t.discrete_us.load(Ordering::Relaxed), 1_400_000);
+        t.record(&[touch(capture::TouchKind::Move)], 1_410_000);
+        assert_eq!(t.burst_us.load(Ordering::Relaxed), 1_410_000);
+    }
 
     #[test]
     fn maps_stream_pixels_to_logical_coordinates() {

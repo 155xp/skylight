@@ -316,8 +316,8 @@ function videoCore() {
     }
 
     /**
-     * Paint on arrival: the newest frame simply wins. With `smooth` on, at most one frame per
-     * display refresh while frames arrive unevenly: over a jittery network two frames often land
+     * Paint on arrival: the newest frame simply wins. With `smooth` (the default), at most one
+     * frame per display refresh while frames arrive unevenly: over a jittery network two frames often land
      * within the same refresh, drawing both hides the first, and the refresh after them repeats
      * the second, which is judder. Then a frame waits for the next refresh when another was
      * already drawn since the last one, and a newer frame replaces one that waits, so nothing is
@@ -596,8 +596,9 @@ export class Skylight extends EventTarget {
    *   maxBitrate?: number, codecs?: string[], cmdKey?: 'ctrl'|'super', touchMode?: 'trackpad'|'direct',
    *   scale?: 'fit'|'native', viewOnly?: boolean, clipboard?: boolean, reconnect?: boolean,
    *   monitor?: string, smooth?: boolean}} options
-   *   `smooth`: on a jittery link, show at most one frame per display refresh (less judder, up to a
-   *   refresh more latency; see VideoSink.present).
+   *   `smooth` (on by default): while frames arrive unevenly (a jittery tunnel), show at most one
+   *   per display refresh, for less judder at up to a refresh more latency; frames that arrive
+   *   evenly are drawn at once either way (see VideoSink.present).
    */
   constructor(container, options) {
     super();
@@ -610,6 +611,7 @@ export class Skylight extends EventTarget {
       viewOnly: false,
       clipboard: true,
       reconnect: true,
+      smooth: true,
       ...options,
     };
     this.state = 'idle';

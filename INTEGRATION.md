@@ -109,7 +109,7 @@ embed API, all optional except `url` and `ticket`:
 | `touchMode` | `'trackpad'` | phones: relative pointer like a laptop trackpad, or `'direct'` taps |
 | `scale` | `'fit'` | or `'native'` for one stream pixel per device pixel |
 | `worker` | `true` | decode in a worker so the page's own work never delays a frame; `false` decodes on the page's thread |
-| `smooth` | `false` | while frames arrive unevenly (a jittery tunnel), show at most one per display refresh: less judder, for up to a refresh more latency; frames that arrive evenly are drawn at once either way |
+| `smooth` | `true` | while frames arrive unevenly (a jittery tunnel), show at most one per display refresh: less judder, for up to a refresh more latency; frames that arrive evenly are drawn at once either way; `false` draws every frame the moment it is decoded |
 
 Methods: `connect()`, `disconnect()`, `setMonitor(id)`, `setOptions({...})`, `showKeyboard()`
 (call from a tap, opens the iPhone keyboard), `typeText(s)`, `sendKeys([evdev codes])` (for

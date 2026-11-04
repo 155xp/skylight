@@ -4,7 +4,7 @@
 //                          [--key ~/.config/skylight/ticket-private.pem] [--aud <hostname>]
 //                          [--screenshot out.png] [--json out.json] [--headed]
 //                          [--modes click,key,move] [--no-motion] [--server-pid N] [--x-pid N]
-//                          [--idle 10] [--connects N] [--quality N] [--mbps M] [--smooth]
+//                          [--idle 10] [--connects N] [--quality N] [--mbps M] [--no-smooth]
 //
 // It mints a ticket, opens the viewer, then measures:
 //   * click-to-update, keypress-to-glyph and pointer-move latency through the probe window
@@ -49,7 +49,7 @@ const t0 = Date.now();
 // Tunnels sometimes reset a fresh connection; retry the page load (the ticket is not spent yet).
 for (let attempt = 1; ; attempt++) {
   try {
-    await page.goto(`${base}#ticket=${ticket}&stats${flag('no-worker') ? '&noworker' : ''}${flag('smooth') ? '&smooth' : ''}`);
+    await page.goto(`${base}#ticket=${ticket}&stats${flag('no-worker') ? '&noworker' : ''}${flag('no-smooth') ? '&nosmooth' : ''}`);
     break;
   } catch (e) {
     if (attempt >= 4) throw e;

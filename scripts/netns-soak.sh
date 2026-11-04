@@ -30,4 +30,7 @@ export TESTBED_PORT=${TESTBED_PORT:-5592} TESTBED_DISPLAY=${TESTBED_DISPLAY:-:73
 export TESTBED_DIR=${TESTBED_DIR:-${TMPDIR:-/tmp}/skylight-netns-$$}
 scripts/testbed.sh start "$bin" >/dev/null
 trap 'scripts/testbed.sh stop' EXIT
+# A real desktop behind the probe, so keyframes cost what they do on a real screen (a black
+# virtual display makes them nearly free).
+DISPLAY=$TESTBED_DISPLAY feh --no-fehbg --bg-fill "${SOAK_WALLPAPER:-docs/results/viewer-desktop.png}"
 node scripts/soak.mjs --base "http://127.0.0.1:$TESTBED_PORT/" --key "$TESTBED_DIR/ticket-private.pem" "$@"

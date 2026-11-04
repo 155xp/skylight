@@ -45,6 +45,8 @@ pub struct Pacer {
     ceiling: Option<(u64, u64)>,
     slow_start: bool,
     blocked_since_us: Option<u64>,
+    /// When the last ack arrived (or the first frame went out, before any).
+    last_ack_us: Option<u64>,
     pub skipped: u64,
     pub stalls: u64,
 }
@@ -60,8 +62,10 @@ const RATE_WINDOW_US: u64 = 1_000_000;
 const ADJUST_EVERY_US: u64 = 200_000;
 const CUT_EVERY_US: u64 = 300_000;
 const CEILING_US: u64 = 15_000_000;
-/// A frame unacknowledged this long means the viewer stopped decoding (a hidden tab, a decoder
-/// reset); stop waiting for it.
+/// No ack at all for this long, with frames in flight, means the viewer stopped decoding (a hidden
+/// tab, a decoder reset); stop waiting for it. On a slow path (a VPN exit, a relay) acks still
+/// come, only late, and the limit grows with the round trip: a keyframe sent into a path that is
+/// merely slow would only add to the queue that delays the acks.
 const STALL_US: u64 = 3_000_000;
 
 impl Pacer {
@@ -82,6 +86,7 @@ impl Pacer {
             ceiling: None,
             slow_start: true,
             blocked_since_us: None,
+            last_ack_us: None,
             skipped: 0,
             stalls: 0,
         }
@@ -92,6 +97,9 @@ impl Pacer {
     }
 
     pub fn on_send(&mut self, id: u32, bytes: usize, now_us: u64) {
+        if self.inflight.is_empty() {
+            self.last_ack_us = Some(now_us);
+        }
         self.inflight.push_back(Sent {
             id,
             bytes: bytes as u32,
@@ -111,6 +119,7 @@ impl Pacer {
             }
             let f = self.inflight.pop_front().unwrap();
             self.acked.push_back((now_us, f.bytes));
+            self.last_ack_us = Some(now_us);
             if f.id == id {
                 rtt = Some(now_us.saturating_sub(f.at_us));
             }
@@ -183,10 +192,9 @@ impl Pacer {
     /// True (once) when the viewer has stopped acknowledging altogether. The window is cleared so
     /// the stream can resume; the caller should send a keyframe, since frames were lost.
     pub fn stalled(&mut self, now_us: u64) -> bool {
-        let stuck = self
-            .inflight
-            .front()
-            .is_some_and(|f| now_us.saturating_sub(f.at_us) > STALL_US);
+        let limit = STALL_US.max(4 * self.srtt_us as u64).min(10_000_000);
+        let stuck = !self.inflight.is_empty()
+            && self.last_ack_us.is_some_and(|t| now_us.saturating_sub(t) > limit);
         if stuck {
             self.inflight.clear();
             self.blocked_since_us = None;
@@ -456,6 +464,20 @@ mod tests {
         assert!(!p.can_send(1_000_000));
         assert!(p.stalled(STALL_US + 1));
         assert!(p.can_send(STALL_US + 2));
+    }
+
+    #[test]
+    fn a_slow_path_that_still_acks_is_not_a_stall() {
+        // A VPN exit behind a relay: each frame takes 3.5 s to come back, but acks keep arriving.
+        let mut p = Pacer::new(2_000_000, 500_000, 50_000_000, 60);
+        for id in 0..20u32 {
+            p.on_send(id, 20_000, id as u64 * 500_000);
+        }
+        for id in 0..12u32 {
+            let now = 3_500_000 + id as u64 * 500_000;
+            p.on_ack(id, now);
+            assert!(!p.stalled(now + 400_000), "frame {id}");
+        }
     }
 
     #[test]

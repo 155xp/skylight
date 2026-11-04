@@ -970,8 +970,9 @@ mod tests {
         // The case refinement is for: a big change squeezed under a low cap, then the same image
         // re-encoded. With a QP offset the refinement must get measurably closer to the source.
         let run = |sharpen: u8| {
-            // 8 Mbit/s: room under the cap for the refinement to spend more bits.
-            let mut enc = software(640, 360, 8_000_000, Some(23));
+            // 16 Mbit/s: room under the cap for the refinement to spend more bits. Nearer the cap
+            // (8 Mbit/s) the gain swings between 0.2 and 1.7 dB with x264's thread count.
+            let mut enc = software(640, 360, 16_000_000, Some(23));
             let mut dec = crate::bench::Decoder::new(Codec::H264, 640, 360).unwrap();
             let mut out = Vec::new();
             enc.input().unwrap().0.fill(0);
@@ -998,7 +999,7 @@ mod tests {
         };
         let (plain, sharp) = (run(0), run(8));
         assert!(
-            sharp > plain + 0.5,
+            sharp > plain + 2.0,
             "sharpened {sharp:.2} dB vs plain {plain:.2} dB"
         );
     }

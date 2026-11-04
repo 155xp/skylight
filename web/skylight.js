@@ -58,6 +58,9 @@ const MODIFIERS = new Set([29, 97, 42, 54, 56, 100, 125, 126]);
 
 const isApple = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent);
 
+/** A connection that brings nothing for this long (ms) is dead (see Skylight._abandon). */
+const SILENT_SERVER_MS = 4000;
+
 function median(a) {
   if (!a.length) return 0;
   const s = [...a].sort((x, y) => x - y);
@@ -1082,6 +1085,7 @@ export class Skylight extends EventTarget {
         }));
       };
       ws.onmessage = (ev) => {
+        this._heard = performance.now();
         this.received.messages++;
         this.received.bytes += typeof ev.data === 'string' ? ev.data.length : ev.data.byteLength;
         if (typeof ev.data === 'string') {
@@ -1129,6 +1133,25 @@ export class Skylight extends EventTarget {
    * blip, and the next connection works. Later tries back off. `retry` only starts over once a new
    * connection shows a frame, so a session that fails right after its welcome backs off too.
    */
+  /**
+   * The server went silent: it sends stats and answers pings every second, so the connection is
+   * dead even though nothing closed it (a tunnel or NAT that stopped forwarding). Drop it and
+   * reconnect now; TCP can take many minutes to give up, and through a proxy it never notices.
+   */
+  _abandon() {
+    const ws = this.ws;
+    if (!ws) return;
+    ws.onclose = null;
+    ws.onmessage = null;
+    ws.close();
+    this.ws = null;
+    this._teardown();
+    if (!this._closing) {
+      this._setState('disconnected', 'the connection went silent');
+      this._scheduleReconnect();
+    }
+  }
+
   _scheduleReconnect() {
     if (!this.opts.reconnect || this._closing || typeof this.opts.ticket !== 'function') return;
     const delay = [0, 500, 1000, 2000, 5000, 10000][Math.min(this.retry++, 5)];
@@ -1173,9 +1196,11 @@ export class Skylight extends EventTarget {
     this._ping();
     this._pingTimer = setInterval(() => this._ping(), 1000);
     this._connectedAt = performance.now();
+    this._heard = performance.now();
     this._statsTimer = setInterval(() => {
       this._publishStats();
       this._watchdog();
+      if (performance.now() - this._heard > SILENT_SERVER_MS) this._abandon();
     }, 1000);
     this._updateCursorMode();
   }

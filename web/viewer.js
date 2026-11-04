@@ -56,6 +56,7 @@ window.skylight = view;
 view.addEventListener('state', (e) => {
   const { state, detail } = e.detail;
   if (state === 'connecting') status('Connecting', wsUrl.replace(/^wss?:\/\//, ''));
+  else if (state === 'reconnecting') status('Reconnecting', 'The connection stalled; waiting for it to come back.');
   else if (state === 'connected') {
     status(null);
     view.focus();

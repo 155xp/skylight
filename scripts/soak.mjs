@@ -61,15 +61,25 @@ const r = await page.evaluate(async ([url, seconds, mode]) => {
   };
   let connected = false;
   let done = false;
+  let stalled = false;
+  out.stalls = 0;
+  out.recovered = 0;
   view.addEventListener('state', (e) => {
     const { state, detail } = e.detail;
-    if (state === 'connected') {
+    if (state === 'reconnecting') {
+      stalled = true;
+      out.stalls++;
+    } else if (state === 'connected' && stalled) {
+      stalled = false; // the same connection, back after a stall
+      out.recovered++;
+    } else if (state === 'connected') {
       out.welcomes++;
       connected = true;
       // Keep the picture moving: the probe lives as long as its session, so start it each time.
       view._send({ t: 'bench', action: 'start', mode });
     } else if (state === 'disconnected' && connected && !done) {
       connected = false;
+      stalled = false;
       out.drops.push({ atS: Math.round((performance.now() - t0) / 100) / 10, why: String(detail || '') });
       droppedAt = performance.now();
     }
@@ -103,6 +113,8 @@ const result = {
   drops: r.drops.length,
   dropsPerMin: +(r.drops.length / (seconds / 60)).toFixed(2),
   sessions: r.welcomes,
+  stalls: r.stalls,
+  stallsRecovered: r.recovered,
   livePct: +(100 * r.liveShare).toFixed(1),
   fps: +r.fps.toFixed(1),
   longestFreezeMs: Math.round(r.longestFreezeMs),

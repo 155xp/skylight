@@ -58,8 +58,25 @@ const MODIFIERS = new Set([29, 97, 42, 54, 56, 100, 125, 126]);
 
 const isApple = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent);
 
-/** A connection that brings nothing for this long (ms) is dead (see Skylight._abandon). */
+/**
+ * A connection that brings nothing for this long (ms) has stalled: the view says it is
+ * reconnecting and fetches the next ticket, but keeps the socket (see Skylight._quiet).
+ */
 const SILENT_SERVER_MS = 4000;
+/**
+ * And it is given up for dead after this long, or four round trips on a slow path, where one big
+ * frame can take seconds. Through a VPN a blackout of a few seconds is common (a rekey, a roam), and
+ * TCP's backoff then brings data back a second or two after the path; giving up at 4 s threw such
+ * connections away just before they recovered, for a reconnect that costs more than the wait.
+ */
+const DEAD_SERVER_MS = 10000;
+/**
+ * Before its first frame, a connection is given this long: it has just proven itself with the
+ * welcome, and the first keyframe, one WebSocket message, may take seconds on a slow path.
+ */
+const SILENT_FIRST_FRAME_MS = 15000;
+/** A reconnect within this long (ms) starts at the bitrate the last session settled at. */
+const PATH_MEMORY_MS = 10 * 60_000;
 
 function median(a) {
   if (!a.length) return 0;
@@ -656,6 +673,8 @@ export class Skylight extends EventTarget {
       // with the same ticket.
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
+          if (!ticket && this._ticketAhead) ticket = await this._ticketAhead;
+          this._ticketAhead = null;
           if (!ticket) ticket = typeof this.opts.ticket === 'function' ? await this.opts.ticket() : this.opts.ticket;
           await this._open(url, ticket);
           return;
@@ -1084,10 +1103,12 @@ export class Skylight extends EventTarget {
           maxFps: this.opts.maxFps || this.refreshHz || 60,
           maxBitrate: this.opts.maxBitrate,
           monitor: this.opts.monitor,
+          startBitrate: this._path && Date.now() - this._path.at < PATH_MEMORY_MS ? this._path.bps : undefined,
         }));
       };
       ws.onmessage = (ev) => {
         this._heard = performance.now();
+        if (this._stalled && this.ws === ws) this._unstall();
         this.received.messages++;
         this.received.bytes += typeof ev.data === 'string' ? ev.data.length : ev.data.byteLength;
         if (typeof ev.data === 'string') {
@@ -1131,10 +1152,31 @@ export class Skylight extends EventTarget {
   }
 
   /**
-   * The first try after a working stream drops goes at once: through a tunnel that is usually a
-   * blip, and the next connection works. Later tries back off. `retry` only starts over once a new
-   * connection shows a frame, so a session that fails right after its welcome backs off too.
+   * Once a second while connected, with how long the server has said nothing. Before a
+   * connection's first frame it gets SILENT_FIRST_FRAME_MS; after, a stall shows as 'reconnecting'
+   * at once and the next ticket is fetched ahead, but the socket is only given up at
+   * DEAD_SERVER_MS (or four round trips), since through a VPN most stalls recover on their own.
    */
+  _quiet(ms) {
+    const dead = this._framed ? Math.min(Math.max(DEAD_SERVER_MS, 4 * this._srtt), SILENT_FIRST_FRAME_MS) : SILENT_FIRST_FRAME_MS;
+    if (ms > dead) {
+      this._abandon();
+    } else if (this._framed && ms > Math.max(SILENT_SERVER_MS, 2 * this._srtt) && !this._stalled) {
+      this._stalled = true;
+      this._setState('reconnecting', 'the connection stalled');
+      if (typeof this.opts.ticket === 'function') {
+        this._ticketAhead = Promise.resolve().then(() => this.opts.ticket()).catch(() => null);
+      }
+    }
+  }
+
+  /** Data again on a connection that had stalled: it is live after all. */
+  _unstall() {
+    this._stalled = false;
+    this._ticketAhead = null;
+    if (this.ws) this._setState('connected', this.welcome);
+  }
+
   /**
    * The server went silent: it sends stats and answers pings every second, so the connection is
    * dead even though nothing closed it (a tunnel or NAT that stopped forwarding). Drop it and
@@ -1154,6 +1196,11 @@ export class Skylight extends EventTarget {
     }
   }
 
+  /**
+   * The first try after a working stream drops goes at once: through a tunnel that is usually a
+   * blip, and the next connection works. Later tries back off. `retry` only starts over once a new
+   * connection shows a frame, so a session that fails right after its welcome backs off too.
+   */
   _scheduleReconnect() {
     if (!this.opts.reconnect || this._closing || typeof this.opts.ticket !== 'function') return;
     const delay = [0, 500, 1000, 2000, 5000, 10000][Math.min(this.retry++, 5)];
@@ -1199,10 +1246,13 @@ export class Skylight extends EventTarget {
     this._pingTimer = setInterval(() => this._ping(), 1000);
     this._connectedAt = performance.now();
     this._heard = performance.now();
+    this._framed = false;
+    this._stalled = false;
+    this._srtt = 0;
     this._statsTimer = setInterval(() => {
       this._publishStats();
       this._watchdog();
-      if (performance.now() - this._heard > SILENT_SERVER_MS) this._abandon();
+      this._quiet(performance.now() - this._heard);
     }, 1000);
     this._updateCursorMode();
   }
@@ -1293,6 +1343,7 @@ export class Skylight extends EventTarget {
         c.offset = best.offset;
         c.bestRtt = best.rtt;
         c.rtt = rtt;
+        this._srtt = this._srtt ? this._srtt * 0.875 + rtt * 0.125 : rtt;
         break;
       }
       case 'stream':
@@ -1304,6 +1355,8 @@ export class Skylight extends EventTarget {
         break;
       case 'stats':
         this.serverStats = m;
+        // What the path carries, for the next connection's start (see the hello).
+        if (m.targetKbps) this._path = { bps: m.targetKbps * 1000, at: Date.now() };
         break;
       case 'clipboard':
         this._onRemoteClipboard(m.text);
@@ -1399,6 +1452,7 @@ export class Skylight extends EventTarget {
       }
       case 'frame': {
         this.retry = 0;
+        this._framed = true;
         const now = local(m.decoded);
         const recv = local(m.recv);
         const w = this.win;

@@ -46,8 +46,10 @@ const view = new Skylight($('screen'), {
   touchMode: settings.touchMode,
   maxBitrate: Number(settings.bitrate) ? Number(settings.bitrate) * 1e6 : undefined,
   reconnect: false,
-  // #noworker decodes on the page's thread (for comparisons).
+  // #noworker decodes on the page's thread (for comparisons); #smooth trades up to a refresh of
+  // latency for less judder on a jittery link.
   worker: !params.has('noworker'),
+  smooth: params.has('smooth'),
 });
 window.skylight = view;
 

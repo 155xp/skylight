@@ -194,6 +194,17 @@ function videoCore() {
       this.stalls = 0;
       this.black = 0;
       this.probe = null;
+      // One frame per display refresh (see present()), where this thread has refreshes to wait for.
+      this.smooth = false;
+      this.raf = typeof requestAnimationFrame === 'function' ? (cb) => requestAnimationFrame(cb) : null;
+      this.held = null;
+      this.drawnAt = 0;
+      this.lastRefresh = 0;
+      this.refreshMs = 1000 / 60;
+      this.tickPending = false;
+      this.lastDecoded = 0;
+      this.ivMean = 1000 / 60;
+      this.jitter = 0;
     }
 
     static now() {
@@ -289,9 +300,7 @@ function videoCore() {
       this.pending.delete(id);
       // Anything older than this frame was dropped by the decoder.
       for (const k of this.pending.keys()) if (k < id) this.pending.delete(k);
-      // Paint on arrival: no waiting for an animation frame, the newest frame simply wins.
-      this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
-      this.shownAt = now;
+      // Acknowledged on decode, which is what the server paces on, whenever it is drawn.
       if (meta) {
         const ack = new ArrayBuffer(12);
         const dv = new DataView(ack);
@@ -300,13 +309,93 @@ function videoCore() {
         dv.setUint32(8, Math.round((now - meta.recv) * 1000), true);
         this.hooks.send(ack);
       }
+      this.present({ frame, decoded: now, meta });
+    }
+
+    /**
+     * Paint on arrival: the newest frame simply wins. With `smooth` on, at most one frame per
+     * display refresh while frames arrive unevenly: over a jittery network two frames often land
+     * within the same refresh, drawing both hides the first, and the refresh after them repeats
+     * the second, which is judder. Then a frame waits for the next refresh when another was
+     * already drawn since the last one, and a newer frame replaces one that waits, so nothing is
+     * ever more than a refresh late. Frames that arrive evenly (a LAN), and the frame that answers
+     * a click on a still screen, are drawn the moment they are decoded either way.
+     */
+    present(f) {
+      if (!this.smooth || !this.raf) {
+        this.draw(f);
+        return;
+      }
+      // How unevenly frames arrive: the mean deviation of the intervals between them, over runs
+      // of motion (a pause is not jitter).
+      const iv = f.decoded - this.lastDecoded;
+      this.lastDecoded = f.decoded;
+      if (iv < this.refreshMs * 3) {
+        this.ivMean += (iv - this.ivMean) / 8;
+        this.jitter += (Math.abs(iv - this.ivMean) - this.jitter) / 16;
+      }
+      if (this.jitter > 2.5 && this.sameRefresh(this.drawnAt, f.decoded)) {
+        if (this.held) this.drop(this.held);
+        this.held = f;
+        this.requestTick();
+        return;
+      }
+      this.draw(f);
+    }
+
+    /**
+     * Whether no display refresh begins between moments `a` and `b`. Refreshes are counted from
+     * the start of the last one seen; the time, not a flag set by its callback, decides, since the
+     * callback runs a little after the refresh begins.
+     */
+    sameRefresh(a, b) {
+      if (!a || !this.lastRefresh) return false;
+      const p = this.refreshMs;
+      return Math.floor((a - this.lastRefresh) / p) === Math.floor((b - this.lastRefresh) / p);
+    }
+
+    requestTick() {
+      if (this.tickPending) return;
+      this.tickPending = true;
+      this.raf((t) => this.tick(performance.timeOrigin + t));
+    }
+
+    draw({ frame, decoded, meta }) {
+      this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+      const now = VideoSink.now();
+      this.shownAt = now;
+      this.drawnAt = now;
+      if (this.smooth && this.raf) this.requestTick();
       if (this.watch) {
         // For latency measurements, which read pixels out of the decoded frame.
         const copy = frame.clone();
-        this.hooks.event({ t: 'vframe', frame: copy, decoded: now, meta }, [copy]);
+        this.hooks.event({ t: 'vframe', frame: copy, decoded, drawn: now, meta }, [copy]);
       }
       frame.close();
-      if (meta) this.hooks.event({ t: 'frame', decoded: now, ...meta });
+      if (meta) this.hooks.event({ t: 'frame', decoded, drawn: now, ...meta });
+    }
+
+    /** A display refresh began at `at`: a frame that waited for it is drawn now. */
+    tick(at) {
+      this.tickPending = false;
+      // The refresh period, from consecutive refreshes (a skipped one would double it).
+      const d = at - this.lastRefresh;
+      if (d > 3 && d < this.refreshMs * 1.5) this.refreshMs += (d - this.refreshMs) * 0.2;
+      this.lastRefresh = at;
+      if (!this.held) return;
+      if (this.sameRefresh(this.drawnAt, VideoSink.now())) {
+        this.requestTick();
+        return;
+      }
+      const f = this.held;
+      this.held = null;
+      this.draw(f);
+    }
+
+    /** A frame replaced before it could be drawn: counted, never shown. */
+    drop({ frame, decoded, meta }) {
+      frame.close();
+      if (meta) this.hooks.event({ t: 'frame', decoded, drawn: null, ...meta });
     }
 
     /** A new stream (codec, size or monitor) starts with its own keyframe. */
@@ -384,6 +473,8 @@ function videoCore() {
       this.decoder = null;
       this.config = null;
       this.pending.clear();
+      if (this.held) this.held.frame.close();
+      this.held = null;
     }
   }
 
@@ -404,6 +495,7 @@ function videoWorker(core) {
   let sink = null;
   let watch = false;
   let software = false;
+  let smooth = false;
   self.onmessage = (e) => {
     const m = e.data;
     if (m.t === 'canvas') {
@@ -420,6 +512,7 @@ function videoWorker(core) {
       });
       sink.watch = watch;
       sink.software = software;
+      sink.smooth = smooth;
       const own = sink;
       sock.onopen = () => self.postMessage({ t: 'open', id });
       sock.onmessage = (ev) => {
@@ -448,6 +541,9 @@ function videoWorker(core) {
     } else if (m.t === 'watch') {
       watch = m.on;
       if (sink) sink.watch = m.on;
+    } else if (m.t === 'smooth') {
+      smooth = m.on;
+      if (sink) sink.smooth = m.on;
     } else if (m.t === 'check') {
       if (sink) {
         sink.check(m.luma, m.connectedMs);
@@ -496,7 +592,9 @@ export class Skylight extends EventTarget {
    * @param {{url: string|string[], ticket: string|(() => Promise<string>|string), maxFps?: number,
    *   maxBitrate?: number, codecs?: string[], cmdKey?: 'ctrl'|'super', touchMode?: 'trackpad'|'direct',
    *   scale?: 'fit'|'native', viewOnly?: boolean, clipboard?: boolean, reconnect?: boolean,
-   *   monitor?: string}} options
+   *   monitor?: string, smooth?: boolean}} options
+   *   `smooth`: on a jittery link, show at most one frame per display refresh (less judder, up to a
+   *   refresh more latency; see VideoSink.present).
    */
   constructor(container, options) {
     super();
@@ -587,6 +685,7 @@ export class Skylight extends EventTarget {
     }
     if ('scale' in o) this._layout();
     if ('touchMode' in o) this._updateCursorMode();
+    if ('smooth' in o) this._setSmooth(!!o.smooth);
   }
 
   requestKeyframe() {
@@ -740,7 +839,7 @@ export class Skylight extends EventTarget {
     return { samples: tc.decoded.length, uniqueFps: tc.codes.size / secs, rejected: tc.bad, decoded: sum(tc.decoded), shown: sum(tc.shown) };
   }
 
-  _timecodeCheck(frame, now) {
+  _timecodeCheck(frame, now, drawnAt = now) {
     const tc = this._timecode;
     const [x, y] = tc.probe;
     const rect = { x: x & ~1, y: y & ~1, width: (32 * 14 + 2) & ~1, height: 48 };
@@ -780,7 +879,7 @@ export class Skylight extends EventTarget {
         drawnUs += Math.round((nowServerUs - drawnUs) / span) * span;
         const drawn = drawnUs / 1000 - this.clock.offset;
         tc.decoded.push(now - drawn);
-        requestAnimationFrame((t) => tc.shown.push(Math.max(t, now) - drawn));
+        requestAnimationFrame((t) => tc.shown.push(Math.max(t, drawnAt) - drawn));
       } finally {
         copy.close();
       }
@@ -868,6 +967,7 @@ export class Skylight extends EventTarget {
           send: (d) => (typeof d === 'string' ? this.ws && this.ws.readyState === 1 && this.ws.send(d) : this._sendBin(d)),
           event: (ev) => this._onSinkEvent(ev),
         });
+        this._setSmooth(!!this.opts.smooth);
         resolve();
       };
       if (this.opts.worker === false || typeof Worker === 'undefined' || !('transferControlToOffscreen' in canvas)) {
@@ -908,6 +1008,7 @@ export class Skylight extends EventTarget {
         worker.onerror = null;
         worker.onmessage = (ev) => this._onWorker(ev.data);
         this.worker = worker;
+        this._setSmooth(!!this.opts.smooth);
         resolve();
       };
     });
@@ -1261,9 +1362,11 @@ export class Skylight extends EventTarget {
         break;
       case 'vframe': {
         const now = local(m.decoded);
+        // When it was drawn, which can be a refresh after it was decoded (see present()).
+        const drawn = m.drawn ? local(m.drawn) : now;
         const meta = m.meta && { ...m.meta, recv: local(m.meta.recv) };
-        if (this.bench || this._benchWatch) this._benchCheck(m.frame, now, meta);
-        if (this._timecode) this._timecodeCheck(m.frame, now);
+        if (this.bench || this._benchWatch) this._benchCheck(m.frame, now, meta, drawn);
+        if (this._timecode) this._timecodeCheck(m.frame, now, drawn);
         m.frame.close();
         break;
       }
@@ -1282,11 +1385,16 @@ export class Skylight extends EventTarget {
           const encoded = captureLocal + (m.queueUs + m.encodeUs) / 1000;
           w.network.push(Math.max(0, recv - encoded));
           w.server.push((m.queueUs + m.encodeUs) / 1000);
-          requestAnimationFrame((t) => {
-            // rAF time is when this frame's composite begins; the drawn canvas shows with it.
-            w.e2e.push(Math.max(t, now) - captureLocal);
-            w.display.push(Math.max(0, t - now));
-          });
+          // A frame a newer one replaced before it was drawn (`drawn` null) never reached the
+          // screen; one drawn a refresh late counts from when it was drawn.
+          if (m.drawn !== null) {
+            const drawn = m.drawn ? local(m.drawn) : now;
+            requestAnimationFrame((t) => {
+              // rAF time is when this frame's composite begins; the drawn canvas shows with it.
+              w.e2e.push(Math.max(t, drawn) - captureLocal);
+              w.display.push(Math.max(0, Math.max(t, drawn) - now));
+            });
+          }
         } else {
           w.refines++;
         }
@@ -1294,6 +1402,11 @@ export class Skylight extends EventTarget {
       }
       default:
     }
+  }
+
+  _setSmooth(on) {
+    if (this.worker) this.worker.postMessage({ t: 'smooth', on });
+    else if (this._sink) this._sink.smooth = on;
   }
 
   /** Hand decoded frames to the latency measurements while one runs. */
@@ -1854,13 +1967,13 @@ export class Skylight extends EventTarget {
         t0,
         probe,
         test: (level) => (wantHigh ? level > threshold : level < threshold),
-        done: (decodedAt) => {
+        done: (decodedAt, drawnAt = decodedAt) => {
           clearTimeout(timer);
           this.bench = null;
-          // The frame was drawn at decodedAt; it reaches the screen with the first animation
-          // frame after that. The readback finished later, so look that frame up.
+          // The frame was drawn at drawnAt; it reaches the screen with the first animation frame
+          // after that. The readback finished later, so look that frame up.
           const settle = () => {
-            const t = this._rafTimes.find((x) => x >= decodedAt);
+            const t = this._rafTimes.find((x) => x >= drawnAt);
             if (t !== undefined) resolve({ decoded: decodedAt - t0, shown: t - t0 });
             else requestAnimationFrame(settle);
           };
@@ -1871,7 +1984,7 @@ export class Skylight extends EventTarget {
     });
   }
 
-  _benchCheck(frame, now, meta) {
+  _benchCheck(frame, now, meta, drawnAt = now) {
     const b = this.bench || this._benchWatch;
     if (!b) return;
     // Read the probe's pixels straight from the decoded frame. copyTo is asynchronous and
@@ -1921,7 +2034,7 @@ export class Skylight extends EventTarget {
               bytes: meta.bytes,
             });
           }
-          active.done(now);
+          active.done(now, drawnAt);
         }
       } finally {
         copy.close();

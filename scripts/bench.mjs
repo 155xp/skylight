@@ -4,7 +4,7 @@
 //                          [--key ~/.config/skylight/ticket-private.pem] [--aud <hostname>]
 //                          [--screenshot out.png] [--json out.json] [--headed]
 //                          [--modes click,key,move] [--no-motion] [--server-pid N] [--x-pid N]
-//                          [--idle 10] [--connects N] [--quality N] [--mbps M]
+//                          [--idle 10] [--connects N] [--quality N] [--mbps M] [--smooth]
 //
 // It mints a ticket, opens the viewer, then measures:
 //   * click-to-update, keypress-to-glyph and pointer-move latency through the probe window
@@ -49,7 +49,7 @@ const t0 = Date.now();
 // Tunnels sometimes reset a fresh connection; retry the page load (the ticket is not spent yet).
 for (let attempt = 1; ; attempt++) {
   try {
-    await page.goto(`${base}#ticket=${ticket}&stats${flag('no-worker') ? '&noworker' : ''}`);
+    await page.goto(`${base}#ticket=${ticket}&stats${flag('no-worker') ? '&noworker' : ''}${flag('smooth') ? '&smooth' : ''}`);
     break;
   } catch (e) {
     if (attempt >= 4) throw e;
@@ -118,7 +118,9 @@ if (!flag('no-motion')) {
     view._onSinkEvent = (m) => {
       if (m.t === 'frame' && !m.refine) {
         log.decoded.push(m.decoded);
-        log.drawn.push((m.drawn ?? m.decoded) - performance.timeOrigin);
+        // A client that holds a frame for the next refresh reports when it drew it, or null
+        // for one a newer frame replaced; an older one draws every frame on decode.
+        if (m.drawn !== null) log.drawn.push(('drawn' in m ? m.drawn : m.decoded) - performance.timeOrigin);
       }
       sink(m);
     };
@@ -184,7 +186,8 @@ if (!flag('no-motion')) {
         gap++;
       }
     }
-    result.pacing.display = { frames: drawn.length, neverShown: drawn.length - shown, repeats, refreshes: r.length };
+    const replaced = frameLog.decoded.length - frameLog.drawn.length;
+    result.pacing.display = { frames: drawn.length + replaced, neverShown: drawn.length - shown + replaced, repeats, refreshes: r.length };
   }
   result.cpu = Object.fromEntries(pids.map(([name], i) => [name, Number((((cpu1[i] - cpu0[i]) / motionSecs) * 100).toFixed(1))]));
   const avg = (k) => stats.reduce((a, s) => a + (s[k] || 0), 0) / stats.length;

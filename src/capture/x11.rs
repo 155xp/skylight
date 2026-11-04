@@ -2,7 +2,7 @@
 //!
 //! Only damaged regions are read back. XDamage reports each changed rectangle in its event, the
 //! capture thread sleeps until such events arrive (pointer motion comes as XInput 2 events, so an
-//! idle screen costs nothing), coalesces them up to 240 Hz and pulls just the band of rows that
+//! idle screen costs nothing), coalesces them up to 240 Hz and pulls just the box around what
 //! changed over shared memory.
 
 use std::os::fd::AsRawFd;
@@ -391,29 +391,30 @@ fn capture_loop(
                 }
             }
             if first || !damage.is_empty() {
-                // Read back only the band of rows that changed, into the same place in the
-                // segment.
-                let band = if first {
+                // Read back only the box around what changed. The X server packs its rows
+                // (`area.w` pixels apart) at the start of the segment.
+                let area = if first {
                     Rect::new(0, 0, w, h)
                 } else {
-                    let b = bounds(&damage);
-                    Rect::new(0, b.y, w, b.h)
+                    bounds(&damage)
                 };
                 let t = clock::now_us();
-                let (x, y) = (mon.x as i16, (mon.y + band.y as i32) as i16);
-                let offset = band.y as usize * stride;
+                let (x, y) = (
+                    (mon.x + area.x as i32) as i16,
+                    (mon.y + area.y as i32) as i16,
+                );
                 let pixels: &[u8] = match &mut grab {
                     Grab::Shm { seg, shmseg } => {
                         conn.shm_get_image(
                             root,
                             x,
                             y,
-                            w as u16,
-                            band.h as u16,
+                            area.w as u16,
+                            area.h as u16,
                             !0,
                             xproto::ImageFormat::Z_PIXMAP.into(),
                             *shmseg,
-                            offset as u32,
+                            0,
                         )?
                         .reply()?;
                         seg.bytes()
@@ -425,22 +426,23 @@ fn capture_loop(
                                 root,
                                 x,
                                 y,
-                                w as u16,
-                                band.h as u16,
+                                area.w as u16,
+                                area.h as u16,
                                 !0,
                             )?
                             .reply()?;
-                        let n = img.data.len().min(buf.len() - offset);
-                        buf[offset..offset + n].copy_from_slice(&img.data[..n]);
+                        let n = img.data.len().min(buf.len());
+                        buf[..n].copy_from_slice(&img.data[..n]);
                         buf
                     }
                 };
-                store.update(
+                store.update_region(
                     w,
                     h,
                     PixelFormat::Bgrx,
                     pixels,
-                    stride,
+                    area.w as usize * 4,
+                    area,
                     if first { None } else { Some(&damage) },
                     t,
                     0,

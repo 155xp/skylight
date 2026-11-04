@@ -41,6 +41,15 @@ impl Rect {
         self.x < o.x + o.w && o.x < self.x + self.w && self.y < o.y + o.h && o.y < self.y + self.h
     }
 
+    /// The part of this rectangle inside `o`.
+    pub fn intersect(&self, o: &Rect) -> Option<Rect> {
+        let x0 = self.x.max(o.x);
+        let y0 = self.y.max(o.y);
+        let x1 = (self.x + self.w).min(o.x + o.w);
+        let y1 = (self.y + self.h).min(o.y + o.h);
+        (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
+    }
+
     pub fn clamp(&self, width: u32, height: u32) -> Option<Rect> {
         if self.x >= width || self.y >= height {
             return None;
@@ -53,11 +62,25 @@ impl Rect {
 
 /// Copy `rect` between two 4-byte-per-pixel images.
 pub fn copy_rect(src: &[u8], src_stride: usize, dst: &mut [u8], dst_stride: usize, r: Rect) {
+    copy_rect_from(src, src_stride, (0, 0), dst, dst_stride, r);
+}
+
+/// Copy `rect` of a frame from `src`, which holds only the part of it from `origin` on, into
+/// `dst`, which holds the whole frame.
+pub fn copy_rect_from(
+    src: &[u8],
+    src_stride: usize,
+    origin: (u32, u32),
+    dst: &mut [u8],
+    dst_stride: usize,
+    r: Rect,
+) {
     let row_bytes = r.w as usize * 4;
-    let x_off = r.x as usize * 4;
+    let src_x = (r.x - origin.0) as usize * 4;
+    let dst_x = r.x as usize * 4;
     for row in r.y as usize..(r.y + r.h) as usize {
-        let s = row * src_stride + x_off;
-        let d = row * dst_stride + x_off;
+        let s = (row - origin.1 as usize) * src_stride + src_x;
+        let d = row * dst_stride + dst_x;
         dst[d..d + row_bytes].copy_from_slice(&src[s..s + row_bytes]);
     }
 }
@@ -282,6 +305,39 @@ impl FrameStore {
         capture_us: u64,
         compositor_delay_us: u64,
     ) {
+        let all = Rect::new(0, 0, width, height);
+        self.update_region(
+            width,
+            height,
+            format,
+            src,
+            src_stride,
+            all,
+            damage,
+            capture_us,
+            compositor_delay_us,
+        );
+    }
+
+    /// Like [`update`](Self::update), for a source that read back only `region` of the frame:
+    /// `src` is `region.h` rows of `src_stride` bytes, starting at the region's top left corner.
+    /// Damage outside the region is ignored, and `None` means the whole region changed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_region(
+        &self,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        src: &[u8],
+        src_stride: usize,
+        region: Rect,
+        damage: Option<&[Rect]>,
+        capture_us: u64,
+        compositor_delay_us: u64,
+    ) {
+        let Some(region) = region.clamp(width, height) else {
+            return;
+        };
         {
             let mut st = self.state.lock().unwrap();
             let resized = st.width != width || st.height != height || st.format != format;
@@ -294,25 +350,25 @@ impl FrameStore {
                 st.damage.clear();
             }
             let stride = width as usize * 4;
-            let full = Rect::new(0, 0, width, height);
+            // A new size starts from black, so it needs the whole frame; a source that sent less
+            // fills in the rest with its next updates.
             let rects: Vec<Rect> = match damage {
                 Some(d) if !resized => {
-                    let mut v: Vec<Rect> =
-                        d.iter().filter_map(|r| r.clamp(width, height)).collect();
+                    let mut v: Vec<Rect> = d.iter().filter_map(|r| r.intersect(&region)).collect();
                     let area: u64 = v.iter().map(Rect::area).sum();
-                    if area * 2 > full.area() {
-                        v = vec![full];
+                    if area * 2 > region.area() {
+                        v = vec![region];
                     }
                     v
                 }
-                _ => vec![full],
+                _ => vec![region],
             };
             if rects.is_empty() {
                 return;
             }
             let StoreState { data, .. } = &mut *st;
             for r in &rects {
-                copy_rect(src, src_stride, data, stride, *r);
+                copy_rect_from(src, src_stride, (region.x, region.y), data, stride, *r);
             }
             st.seq += 1;
             let seq = st.seq;
@@ -551,6 +607,36 @@ mod tests {
         let r2 = store.sync_into(r.seq, r.generation, 10, 10, &mut mine, 40);
         assert!(r2.full);
         assert!(mine.iter().all(|&b| b == 5));
+    }
+
+    #[test]
+    fn a_partial_readback_lands_in_place() {
+        // A source that read back only a 3x2 region at (4, 5) of a 10x10 frame.
+        let store = FrameStore::new();
+        store.update(10, 10, PixelFormat::Bgrx, &solid(10, 10, 1), 40, None, 1, 0);
+        let mut mine = vec![0u8; 10 * 10 * 4];
+        let r = store.sync_into(0, 0, 10, 10, &mut mine, 40);
+        let region = Rect::new(4, 5, 3, 2);
+        let mut part = solid(3, 2, 7);
+        part[0] = 8; // the region's top left pixel
+        store.update_region(
+            10,
+            10,
+            PixelFormat::Bgrx,
+            &part,
+            12,
+            region,
+            Some(&[region, Rect::new(0, 0, 2, 2)]),
+            2,
+            0,
+        );
+        let r2 = store.sync_into(r.seq, r.generation, 10, 10, &mut mine, 40);
+        // Damage outside what was read back is dropped.
+        assert_eq!(r2.damage, vec![region]);
+        let px = |x: usize, y: usize| mine[(y * 10 + x) * 4];
+        assert_eq!(px(4, 5), 8);
+        assert_eq!((px(5, 5), px(6, 6)), (7, 7));
+        assert_eq!((px(3, 5), px(7, 5), px(4, 4), px(4, 7), px(0, 0)), (1, 1, 1, 1, 1));
     }
 
     #[test]

@@ -460,13 +460,23 @@ async fn serve(
         + Duration::from_secs(expires.saturating_sub(clock::unix_secs()));
     let mut last_keyframe_req = Instant::now() - Duration::from_secs(1);
     let mut heard = tokio::time::Instant::now();
+    // How the connection ended, for the log: through a VPN or a relay that is what tells a viewer
+    // that left from a path that dropped it.
+    let how: String;
 
     let res: anyhow::Result<()> = loop {
         tokio::select! {
             msg = stream.next() => {
                 let msg = match msg {
                     Some(Ok(m)) => m,
-                    _ => break Ok(()),
+                    Some(Err(e)) => {
+                        how = format!("socket error: {e}");
+                        break Ok(());
+                    }
+                    None => {
+                        how = "socket ended without a close".into();
+                        break Ok(());
+                    }
                 };
                 heard = tokio::time::Instant::now();
                 match msg {
@@ -570,7 +580,13 @@ async fn serve(
                             ClientMsg::Hello { .. } => {}
                         }
                     }
-                    Message::Close(_) => break Ok(()),
+                    Message::Close(f) => {
+                        how = match f {
+                            Some(f) => format!("viewer closed ({})", f.code),
+                            None => "viewer closed".into(),
+                        };
+                        break Ok(());
+                    }
                     _ => {}
                 }
             }
@@ -586,15 +602,31 @@ async fn serve(
             }
             _ = tokio::time::sleep_until(deadline) => {
                 let _ = out_tx.send(text(proto::json(&ServerMsg::Error { message: "session expired" })));
+                how = "session expired".into();
                 break Ok(());
             }
             _ = tokio::time::sleep_until(heard + SILENT_VIEWER) => {
                 // Its slot, its encoder and its capture are needed by whoever reconnects.
+                how = "the viewer went silent".into();
                 break Err(anyhow::anyhow!("the viewer went silent"));
             }
         }
     };
 
+    {
+        let p = shared.pacer.lock().unwrap();
+        tracing::info!(
+            session = %session_id,
+            how = %how,
+            silent_ms = heard.elapsed().as_millis() as u64,
+            rtt_ms = (p.srtt_us / 1000.0) as u64,
+            min_rtt_ms = p.min_rtt_us / 1000,
+            target_kbps = p.target_bps / 1000,
+            stalls = p.stalls,
+            skipped = p.skipped,
+            "connection ended"
+        );
+    }
     if let Some(ctx) = &input {
         ctx.shutdown();
     }

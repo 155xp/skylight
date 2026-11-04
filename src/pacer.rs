@@ -10,8 +10,12 @@
 //!   acks catch up; damage accumulates meanwhile, so nothing is lost. On TCP this is what keeps a
 //!   slow link from building seconds of buffered video.
 //! * **Bitrate.** A delay-based controller: when queueing delay appears (even the best round trip
-//!   of the last half second sits above the long-term minimum, or frames are stuck in flight), the target drops below the rate the browser
-//!   actually acknowledged, and that rate is remembered as the path's ceiling for a while. While
+//!   of the last half second sits above the long-term minimum, or frames are stuck in flight), the
+//!   target drops below the rate the browser actually acknowledged, and that rate is remembered as
+//!   the path's ceiling for a while. A higher round trip counts as a queue only if this stream can
+//!   be what fills it: it sends at least a third of its target, or the path delivers clearly less
+//!   than it sends. A tunnel whose latency drifts by tens of milliseconds for seconds at a time, under
+//!   a stream that uses little of its target, is not slowed down by cutting that target. While
 //!   the link is clear it climbs: fast at first, carefully near the ceiling, then probing gently
 //!   above it. It only climbs while the content uses the bitrate it has; a still screen says
 //!   nothing about the path.
@@ -228,12 +232,14 @@ impl Pacer {
         let blocked = self
             .blocked_since_us
             .is_some_and(|t| now_us.saturating_sub(t) > 150_000);
+        let (sent, delivered) = (self.sent_bps(now_us), self.delivery_bps(now_us));
+        // Whether a queue could be this stream's own doing (see the module comment).
+        let ours = sent * 3 >= self.target_bps || delivered * 10 < sent * 8;
         let old = self.target_bps;
-        if blocked || queue_us > high {
+        if blocked || (queue_us > high && ours) {
             if now_us >= self.last_cut_us + CUT_EVERY_US {
                 self.last_cut_us = now_us;
                 self.slow_start = false;
-                let delivered = self.delivery_bps(now_us);
                 let mut next = self.target_bps * 85 / 100;
                 // A delivered rate well under the target may just be light content; only a
                 // rate near the target says something about the path.
@@ -243,10 +249,7 @@ impl Pacer {
                 }
                 self.target_bps = next.max(self.min_bps);
             }
-        } else if queue_us < low
-            && self.srtt_us > 0.0
-            && self.sent_bps(now_us) * 2 >= self.target_bps
-        {
+        } else if queue_us < low && self.srtt_us > 0.0 && sent * 2 >= self.target_bps {
             let t = self.target_bps;
             self.target_bps = match self.ceiling {
                 _ if self.slow_start => t * 3 / 2,
@@ -378,6 +381,45 @@ mod tests {
             p.adjust(t);
         }
         assert!(p.target_bps > 8_000_000, "target fell to {}", p.target_bps);
+    }
+
+    #[test]
+    fn a_tunnel_whose_latency_drifts_keeps_the_target_of_light_content() {
+        // The round trip swings between 45 and 80 ms over four seconds, nothing queues, and the
+        // stream uses 1.5 Mbit/s of a 16 Mbit/s target: the target must not collapse.
+        let mut p = Pacer::new(16_000_000, 500_000, 50_000_000, 60);
+        let mut t = 0;
+        for id in 0..1200u32 {
+            let phase = (t % 4_000_000) as f64 / 4_000_000.0 * std::f64::consts::TAU;
+            let rtt = 45_000 + (17_500.0 * (1.0 - phase.cos())) as u64;
+            p.on_send(id, 3_100, t);
+            p.on_ack(id, t + rtt);
+            t += 16_667;
+            p.adjust(t);
+        }
+        assert_eq!(p.target_bps, 16_000_000);
+    }
+
+    #[test]
+    fn a_light_stream_on_a_link_slower_than_it_still_backs_off() {
+        // 3 Mbit/s of content into a 2 Mbit/s path: acks fall behind and round trips grow.
+        let mut p = Pacer::new(16_000_000, 500_000, 50_000_000, 60);
+        let mut t = 0u64;
+        let mut link_free = 0u64;
+        for id in 0..600u32 {
+            let bytes = 6_250; // 3 Mbit/s at 60 fps
+            p.on_send(id, bytes, t);
+            // The bottleneck delivers 2 Mbit/s (250 bytes per ms) behind a 20 ms base trip.
+            link_free = link_free.max(t) + bytes as u64 * 1000 / 250;
+            p.on_ack(id, link_free + 20_000);
+            t += 16_667;
+            p.adjust(t);
+        }
+        assert!(
+            p.target_bps < 4_000_000,
+            "target {} should follow the path down",
+            p.target_bps
+        );
     }
 
     #[test]

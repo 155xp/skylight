@@ -15,6 +15,8 @@
 
 use std::ffi::{CString, c_void};
 use std::ptr;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 
@@ -203,6 +205,7 @@ struct Api {
     fns: FunctionList,
     cu_ctx_create: unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> i32,
     cu_ctx_destroy: unsafe extern "C" fn(*mut c_void) -> i32,
+    cu_ctx_pop: unsafe extern "C" fn(*mut *mut c_void) -> i32,
 }
 
 unsafe impl Send for Api {}
@@ -265,6 +268,7 @@ fn load_from(cuda_lib: &str, nvenc_lib: &str) -> Result<Api> {
         fns,
         cu_ctx_create: dlsym(cuda, "cuCtxCreate_v2")?,
         cu_ctx_destroy: dlsym(cuda, "cuCtxDestroy_v2")?,
+        cu_ctx_pop: dlsym(cuda, "cuCtxPopCurrent_v2")?,
     })
 }
 
@@ -273,6 +277,73 @@ fn api() -> Result<&'static Api> {
     API.get_or_init(|| load().map_err(|e| format!("{e:#}")))
         .as_ref()
         .map_err(|e| anyhow!("{e}"))
+}
+
+/// How long the shared CUDA context outlives the last encoder that used it.
+const CONTEXT_LINGER: Duration = Duration::from_secs(60);
+
+/// The CUDA context every encoder in the process opens its session on. Creating one takes about
+/// 40 ms, most of what opening an encoder costs, so encoders share one, and it stays for a minute
+/// after the last of them closes: a viewer that reconnects, a second viewer or a codec switch gets
+/// its encoder without that wait. Then it goes, since it holds driver memory.
+struct Context {
+    ctx: *mut c_void,
+    users: usize,
+    /// Bumped each time the last user lets go, so a delayed release only ends its own idle spell.
+    idle_epoch: u64,
+}
+
+// The handle is only ever passed to the driver, which allows that from any thread.
+unsafe impl Send for Context {}
+
+static CONTEXT: Mutex<Option<Context>> = Mutex::new(None);
+
+fn acquire_context(api: &'static Api) -> Result<*mut c_void> {
+    let mut slot = CONTEXT.lock().unwrap();
+    if let Some(c) = slot.as_mut() {
+        c.users += 1;
+        return Ok(c.ctx);
+    }
+    let mut ctx = ptr::null_mut();
+    // Device 0; CUDA picks the first NVIDIA GPU.
+    if unsafe { (api.cu_ctx_create)(&mut ctx, 0, 0) } != 0 {
+        bail!("cuCtxCreate failed");
+    }
+    // Creating it made it current on this thread. NVENC is handed the context, so leave no thread
+    // holding it (this one may end long before the context does).
+    let mut popped = ptr::null_mut();
+    unsafe { (api.cu_ctx_pop)(&mut popped) };
+    *slot = Some(Context {
+        ctx,
+        users: 1,
+        idle_epoch: 0,
+    });
+    Ok(ctx)
+}
+
+fn release_context(api: &'static Api) {
+    let mut slot = CONTEXT.lock().unwrap();
+    let Some(c) = slot.as_mut() else { return };
+    c.users -= 1;
+    if c.users > 0 {
+        return;
+    }
+    c.idle_epoch += 1;
+    let epoch = c.idle_epoch;
+    drop(slot);
+    let _ = std::thread::Builder::new()
+        .name("cuda-linger".into())
+        .spawn(move || {
+            std::thread::sleep(CONTEXT_LINGER);
+            let mut slot = CONTEXT.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|c| c.users == 0 && c.idle_epoch == epoch)
+            {
+                let c = slot.take().unwrap();
+                unsafe { (api.cu_ctx_destroy)(c.ctx) };
+            }
+        });
 }
 
 /// Per-frame choices beyond "keyframe or not".
@@ -310,11 +381,7 @@ impl NvEncoder {
     pub fn open(p: &EncoderParams) -> Result<NvEncoder> {
         let api = api()?;
         let f = &api.fns;
-        let mut cuda = ptr::null_mut();
-        // Device 0; CUDA picks the first NVIDIA GPU.
-        if unsafe { (api.cu_ctx_create)(&mut cuda, 0, 0) } != 0 {
-            bail!("cuCtxCreate failed");
-        }
+        let cuda = acquire_context(api)?;
         let mut e = NvEncoder {
             api,
             cuda,
@@ -628,7 +695,7 @@ impl Drop for NvEncoder {
                 f.destroy_encoder.unwrap()(self.enc);
             }
             if !self.cuda.is_null() {
-                (self.api.cu_ctx_destroy)(self.cuda);
+                release_context(self.api);
             }
         }
     }

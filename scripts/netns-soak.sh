@@ -9,6 +9,7 @@
 # Profiles (what a VPN exit and a TCP relay in front of the server look like):
 #   vpn   60±25 ms each way, 1% loss, 4 Mbit/s, 1280-byte MTU
 #   bad   80±40 ms each way, 3% loss, 1.5 Mbit/s, 1280-byte MTU
+#   blips vpn, plus a 3 s blackout every 20 s (a VPN that rekeys or roams, a relay that hiccups)
 #   clean 0 ms (the namespace's loopback, unshaped)
 set -eu
 cd "$(dirname "$0")/.."
@@ -22,6 +23,13 @@ ip link set lo up
 case "$profile" in
   vpn) ip link set lo mtu 1280; tc qdisc add dev lo root netem delay 60ms 25ms distribution normal loss 1% rate 4mbit limit 10000 ;;
   bad) ip link set lo mtu 1280; tc qdisc add dev lo root netem delay 80ms 40ms distribution normal loss 3% rate 1500kbit limit 10000 ;;
+  blips)
+    ip link set lo mtu 1280
+    vpn='delay 60ms 25ms distribution normal rate 4mbit limit 10000'
+    tc qdisc add dev lo root netem $vpn loss 1%
+    (while sleep 17; do tc qdisc change dev lo root netem $vpn loss 100%; sleep 3; tc qdisc change dev lo root netem $vpn loss 1%; done) &
+    blip=$!
+    ;;
   clean) ;;
   *) echo "unknown profile $profile" >&2; exit 2 ;;
 esac
@@ -29,7 +37,7 @@ command -v ethtool >/dev/null && ethtool -K lo tso off gso off gro off 2>/dev/nu
 export TESTBED_PORT=${TESTBED_PORT:-5592} TESTBED_DISPLAY=${TESTBED_DISPLAY:-:73}
 export TESTBED_DIR=${TESTBED_DIR:-${TMPDIR:-/tmp}/skylight-netns-$$}
 scripts/testbed.sh start "$bin" >/dev/null
-trap 'scripts/testbed.sh stop' EXIT
+trap 'scripts/testbed.sh stop; [ -z "${blip:-}" ] || kill $blip' EXIT
 # A real desktop behind the probe, so keyframes cost what they do on a real screen (a black
 # virtual display makes them nearly free).
 DISPLAY=$TESTBED_DISPLAY feh --no-fehbg --bg-fill "${SOAK_WALLPAPER:-docs/results/viewer-desktop.png}"

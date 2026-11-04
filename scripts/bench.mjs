@@ -4,7 +4,7 @@
 //                          [--key ~/.config/skylight/ticket-private.pem] [--aud <hostname>]
 //                          [--screenshot out.png] [--json out.json] [--headed]
 //                          [--modes click,key,move] [--no-motion] [--server-pid N] [--x-pid N]
-//                          [--idle 10]
+//                          [--idle 10] [--connects N]
 //
 // It mints a ticket, opens the viewer, then measures:
 //   * click-to-update, keypress-to-glyph and pointer-move latency through the probe window
@@ -14,6 +14,8 @@
 //     gap of more than two intervals) and the frames the server's pacer skipped
 //   * with --server-pid (and --x-pid for the X server it captures), CPU use under motion, and
 //     the server's CPU and what reaches the browser while the screen is still
+//   * with --connects N, N fresh connections: time to the welcome and to the first frame, and
+//     from a dropped socket to the first frame after the client reconnects on its own
 import { chromium } from 'playwright-core';
 import { homedir, hostname } from 'node:os';
 import { writeFileSync } from 'node:fs';
@@ -173,6 +175,62 @@ if (arg('server-pid')) {
     bytesPerSec: Number(((rx1.bytes - rx0.bytes) / secs).toFixed(1)),
   };
   console.log(`idle:   server CPU ${result.idle.serverCpuPercent}% of a core, ${result.idle.messagesPerSec} messages/s, ${result.idle.bytesPerSec} B/s to the browser`);
+}
+
+if (Number(arg('connects', 0)) > 0) {
+  // Connecting: fresh clients in a page of their own, each with a ticket function the way a host
+  // app embeds Skylight (so it may reconnect). For each, the time from connect() to the welcome and
+  // to the first decoded frame, then the time from a dropped socket to the first frame on the new
+  // connection.
+  const p2 = await browser.newPage({ viewport: { width: 1600, height: 900 } });
+  const key = loadPrivateKey(keyPath);
+  await p2.exposeFunction('benchTicket', () => mintTicket(key, { aud, sub: 'bench', scope: ['view', 'input'] }));
+  await p2.goto(base);
+  const ws = new URL('ws', base);
+  ws.protocol = ws.protocol === 'https:' ? 'wss:' : 'ws:';
+  const runs = await p2.evaluate(async ([url, n]) => {
+    const { Skylight } = await import(new URL('skylight.js', location.href).href);
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const el = document.createElement('div');
+      el.style.cssText = 'position:fixed;inset:0';
+      document.body.append(el);
+      const t0 = performance.now();
+      const view = new Skylight(el, { url, ticket: () => window.benchTicket() });
+      let onFrame = null;
+      const sink = view._onSinkEvent.bind(view);
+      view._onSinkEvent = (m) => {
+        if (m.t === 'frame' && onFrame) {
+          onFrame(performance.now());
+          onFrame = null;
+        }
+        sink(m);
+      };
+      const nextFrame = () => new Promise((r) => (onFrame = r));
+      const welcome = new Promise((r) => view.addEventListener('state', (e) => e.detail.state === 'connected' && r(performance.now())));
+      await view._videoReady;
+      const ready = performance.now();
+      let frame = nextFrame();
+      view.connect();
+      const run = { readyMs: ready - t0, welcomeMs: (await welcome) - ready, firstFrameMs: (await frame) - ready };
+      // A dropped connection: the client reconnects on its own.
+      await new Promise((r) => setTimeout(r, 1000));
+      frame = nextFrame();
+      const dropped = performance.now();
+      view.ws.close();
+      run.reconnectMs = (await frame) - dropped;
+      view.disconnect();
+      el.remove();
+      out.push(run);
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    return out;
+  }, [ws.href, Number(arg('connects'))]);
+  await p2.close();
+  const med = (k) => runs.map((r) => r[k]).sort((a, b) => a - b)[Math.floor(runs.length / 2)];
+  const max = (k) => Math.max(...runs.map((r) => r[k]));
+  result.connect = { runs, median: Object.fromEntries(['readyMs', 'welcomeMs', 'firstFrameMs', 'reconnectMs'].map((k) => [k, med(k)])) };
+  console.log(`connect: welcome ${med('welcomeMs').toFixed(0)} ms, first frame ${med('firstFrameMs').toFixed(0)} ms (max ${max('firstFrameMs').toFixed(0)}), after a drop ${med('reconnectMs').toFixed(0)} ms (max ${max('reconnectMs').toFixed(0)}), video worker ready in ${med('readyMs').toFixed(0)} ms; medians of ${runs.length}`);
 }
 
 if (arg('json')) writeFileSync(arg('json'), JSON.stringify(result, null, 2));

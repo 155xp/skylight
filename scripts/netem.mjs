@@ -4,11 +4,18 @@
 // its latency grow exactly as it would on the real thing.
 //
 //   node scripts/netem.mjs --listen 5591 --to 127.0.0.1:5491 --rtt 47 [--mbps 10] [--queue-ms 2000]
-//                          [--jitter 30] [--spike 0.02:120]
+//                          [--jitter 30] [--spike 0.02:120] [--swing 35:4000]
+//                          [--kill /input:500[:1]] [--reset 0.1]
 //
 // --jitter adds up to that many ms to each chunk's one-way delay, at random, in order (like a relay
 // that sometimes holds data back), without reordering anything. --spike p:ms holds a share p of
-// chunks back by up to that much more (a relay's occasional stall).
+// chunks back by up to that much more (a relay's occasional stall). --swing ms:period moves the
+// round trip itself up by as much as ms and back, over each period (ms), the way a relay's
+// latency drifts for seconds at a time.
+//
+// Tunnels also lose connections. --kill path:ms[:n] closes the first n connections (default 1)
+// whose HTTP request is for path, ms after they open (a socket that dies once it is in use);
+// --reset p resets a share p of new connections before anything gets through.
 import net from 'node:net';
 
 const arg = (name, def) => {
@@ -22,6 +29,19 @@ const mbps = Number(arg('mbps', 0));
 const queueMs = Number(arg('queue-ms', 2000));
 const jitter = Number(arg('jitter', 0));
 const [spikeP, spikeMs] = arg('spike', '0:0').split(':').map(Number);
+const [swingMs, swingPeriod] = arg('swing', '0:1').split(':').map(Number);
+const [killPath, killAfter, killCount] = (() => {
+  const k = arg('kill');
+  if (!k) return [null, 0, 0];
+  const [p, ms, n] = k.split(':');
+  return [p, Number(ms), Number(n || 1)];
+})();
+const resetP = Number(arg('reset', 0));
+let killed = 0;
+const t0 = performance.now();
+
+// Extra one-way delay from --swing at time `now`: half the round-trip swing, as a smooth wave.
+const swing = (now) => (swingMs / 2) * (1 - Math.cos((2 * Math.PI * (now - t0)) / swingPeriod)) / 2;
 
 // One direction of the path: chunks leave the bottleneck one after another at `mbps`, then
 // arrive `oneWay` ms later. Reading from the source pauses while the queue is over `queueMs`.
@@ -45,7 +65,7 @@ function pipe(src, dst) {
       linkFree = leaves;
     }
     const spike = Math.random() < spikeP ? Math.random() * spikeMs : 0;
-    const at = Math.max(lastAt, leaves + oneWay + Math.random() * jitter + spike);
+    const at = Math.max(lastAt, leaves + oneWay + swing(now) + Math.random() * jitter + spike);
     lastAt = at;
     q.push({ at, data });
     if (!timer) timer = setTimeout(flush, Math.max(0, q[0].at - now));
@@ -60,13 +80,37 @@ function pipe(src, dst) {
 
 net
   .createServer((client) => {
+    if (resetP > 0 && Math.random() < resetP) {
+      client.resetAndDestroy();
+      return;
+    }
     client.setNoDelay(true);
     const server = net.connect(Number(port), host, () => server.setNoDelay(true));
+    if (killPath) {
+      // The request line arrives in the first chunk: `GET /input HTTP/1.1`.
+      client.once('data', (d) => {
+        const path = d.toString('latin1', 0, 256).split(' ')[1] || '';
+        if (path.split('?')[0] === killPath && killed < killCount) {
+          killed++;
+          setTimeout(() => {
+            client.destroy();
+            server.destroy();
+          }, killAfter);
+        }
+      });
+    }
     pipe(client, server);
     pipe(server, client);
     server.on('close', () => client.destroy());
     client.on('close', () => server.destroy());
   })
   .listen(listen, '127.0.0.1', () => {
-    console.log(`127.0.0.1:${listen} -> ${host}:${port}, ${oneWay * 2} ms round trip${mbps ? `, ${mbps} Mbit/s` : ''}${jitter ? `, up to ${jitter} ms jitter` : ''}`);
+    const extras = [
+      mbps && `${mbps} Mbit/s`,
+      jitter && `up to ${jitter} ms jitter`,
+      swingMs && `swinging up by ${swingMs} ms every ${swingPeriod / 1000} s`,
+      killPath && `closing ${killCount} ${killPath} connection(s) after ${killAfter} ms`,
+      resetP && `resetting ${resetP * 100}% of new connections`,
+    ].filter(Boolean);
+    console.log(`127.0.0.1:${listen} -> ${host}:${port}, ${oneWay * 2} ms round trip${extras.map((e) => `, ${e}`).join('')}`);
   });

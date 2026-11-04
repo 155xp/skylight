@@ -192,6 +192,12 @@ Skylight watches its own picture and repairs it instead of streaming black:
   once instead of after up to 16 more. The client also flushes a decoder that holds frames and
   switches to software decoding if the picture stays stuck or black (`health` events, see
   [INTEGRATION.md](INTEGRATION.md)).
+- **Connections.** A connection that dies without closing (a tunnel or a NAT that stops
+  forwarding) is noticed from both ends: the client gives up on it after 4 s without a message
+  (the server sends stats and answers pings every second) and reconnects at once, and the server
+  ends a session after 90 s without a word from its viewer, so the session slot and the encoder are
+  free for whoever reconnects. A dropped input socket is replaced, with a fresh one-time token;
+  input travels on the main socket meanwhile.
 - **`/healthz`** returns JSON: `status` (`ok` or `degraded`), each running capture (size, frames,
   ms since the source last sent anything, black or not, error) and the last recoveries.
 
@@ -265,6 +271,33 @@ Server time per frame under motion (capture to encode start, plus encode) fell f
 2.9 ms. With a viewer connected to a still screen, the server uses 0.2% of a core (was 0.7%) and
 the GPU's encoder sits at 0%. With the page's own thread kept busy 25 ms out of every 50, motion
 latency to the decoded frame stays at 5.2 ms (15 ms when decoding on that thread, the old way).
+
+### Test bed: connecting, recovering, CPU, smoothness and sharpness
+
+The next round, measured the same way. "Tunnel" is `scripts/netem.mjs --rtt 45 --jitter 18
+--spike 0.004:155`: a 45 ms round trip, up to 36 ms of jitter and rare stalls of up to 155 ms, like
+a public TCP tunnel. Connecting is `bench.mjs --connects 7` (medians, with another viewer already
+watching, as when someone reconnects while their old session winds down); CPU, smoothness and
+dragging (`--motion follow`) are two runs or more each; the page of text is `--quality 8 --mbps 16`.
+
+| | Before | After |
+|---|---|---|
+| Connect to first frame, loopback / tunnel | 307 / 481 ms | **36 / 195 ms** |
+| A dropped connection to the first frame again, loopback / tunnel | 849 / 1036 ms | **39 / 208 ms** |
+| A path that dies without closing (`netem.mjs --hang`) | still frozen after 30 s | **back in 4.2 s** |
+| Session start to encoder open (NVENC) | 50 ms | **15 ms** |
+| CPU under animation, X server / server | 14.4% / 7.6% | **9.5% / 6.8%** |
+| CPU under scrolling text, X server / server | 51-59% / 12-16% | **42-45% / 8-9%** |
+| Tunnel, animation: frames never shown (of about 640) / refreshes repeated (of about 660) | 99-132 / 132-154 | **23-28 / 34-57** |
+| Tunnel, dragging: frames sent per second / pacer skips / hitches, in 11 s | 85 / 173-184 / 73-95 | **55 / 6-9 / 22-23** |
+| Tunnel whose round trip swings 45-80 ms: bitrate target after 20 s of light content | 1.9 Mbit/s | **16 Mbit/s** |
+| A page of text after a change of the whole window (NVENC), once settled | 19-24 dB, 64-107 kB | **39.1 dB, 262 kB** |
+
+The smoother animation costs 3.3 ms of displayed latency through the tunnel, on average (`smooth`,
+on by default; the viewer's `#nosmooth` turns it off); over loopback it does nothing. Clicks, key
+presses and the latency of motion are otherwise unchanged: through a tunnel they are bound by the
+network, the server's share being about 3 ms. The sharper page spends its bytes while the screen is
+still.
 
 The rest of this section was measured with the previous release on a real KDE Plasma desktop.
 
@@ -352,7 +385,9 @@ forced keyframe gets four times the usual budget for that one frame.
 
 About 140 MB of the streaming figure is the NVIDIA driver's pinned memory for the CUDA context
 and NVENC surfaces (`/dev/nvidiactl` and `/dev/zero` mappings). Skylight's own heap is about
-40 MB: one frame store, one encoder input frame and the PipeWire buffers.
+40 MB: one frame store, one encoder input frame and the PipeWire buffers. The CUDA context stays
+for a minute after the last encoder closes (and after startup, which tries every encoder), about
+75 MB for that minute, so a reconnect or a second viewer does not pay the 40 ms of creating one.
 
 ## What makes it fast
 
@@ -361,12 +396,15 @@ and NVENC surfaces (`/dev/nvidiactl` and `/dev/zero` mappings). Skylight's own h
   moves collapsed to its last position, and flushed once. `TCP_NODELAY` is on everywhere, and
   Chrome's `pointerrawupdate` is used where available.
 - **Frames that answer input skip the queue.** For 250 ms after any input, a new frame is encoded
-  the instant it exists, ignoring the frame-rate cap.
+  the instant it exists, ignoring the frame-rate cap. Far away, that holds for clicks, key presses
+  and touches, and for the first frame of a drag or a scroll; the rest of a drag goes at the
+  display's rate, since over a jittery path faster frames are never seen and make the pacer skip.
 - **NVENC without a middleman.** Skylight drives NVENC through NVIDIA's API directly. The session
   writes the damaged rectangles straight into the encoder's own input buffer, so an unchanged
   pixel is never copied twice (1080p encode: 1.9 ms instead of 3.4 ms through FFmpeg). Bitrate
-  changes reconfigure the encoder in place, without a keyframe. FFmpeg's NVENC wrapper, VAAPI and
-  x264 remain as fallbacks.
+  changes reconfigure the encoder in place, without a keyframe. Encoders share one CUDA context,
+  kept for a minute after the last one closes, so a new viewer's encoder opens in 15 ms. FFmpeg's
+  NVENC wrapper, VAAPI and x264 remain as fallbacks.
 - **Zero-latency encoding.** No B-frames, no lookahead, no scene-cut keyframes, an infinite GOP
   (keyframes only on request), ultra-low-latency tuning, and a VBV of 34 ms so no single frame can
   stall the link. Rate control is VBR capped at the target: a frame that changes a few pixels costs
@@ -374,12 +412,14 @@ and NVENC surfaces (`/dev/nvidiactl` and `/dev/zero` mappings). Skylight's own h
   viewer starts sharp.
 - **Capture on demand (X11).** XDamage only marks the screen as changed; the encoder asks for a
   grab at the moment it is ready to encode, so a frame is about 1 ms old when encoding starts, and
-  only the band of rows that changed is read back. Pointer motion arrives as XInput 2 events, so a
+  only the box around what changed is read back. Pointer motion arrives as XInput 2 events, so a
   still screen costs nothing. On KDE, KWin's damage rectangles decide what gets copied.
 - **Decode on arrival, off the page's thread.** The video socket, a `VideoDecoder` with
   `optimizeForLatency` and an `OffscreenCanvas` live in a worker, so layout, charts or garbage
   collection on the page never delay a frame. Each frame is drawn the moment it is decoded, the
-  newest one wins, and it is acknowledged right away.
+  newest one wins, and it is acknowledged right away. While frames arrive unevenly (a jittery
+  tunnel), at most one is drawn per display refresh, so none is drawn over before it is seen and no
+  refresh repeats one for want of a frame (`smooth`).
 - **Pacing that never builds a queue.** At most one round trip's worth of frames is in flight, and
   if the oldest unacknowledged frame is older than the best recent round trip plus a small
   allowance, the next frame is skipped before it is encoded (so no reference is lost); the damage
@@ -387,11 +427,15 @@ and NVENC surfaces (`/dev/nvidiactl` and `/dev/zero` mappings). Skylight's own h
   video. A viewer that stops acknowledging (a hidden tab) is not waited for.
 - **Delay-based bitrate.** When round trips rise above their recent minimum, the target drops
   below what the browser actually acknowledged, and that rate is remembered as the path's
-  ceiling. While the link is clear the target climbs, fast at first, carefully near the ceiling,
-  and only while the content uses what it has.
+  ceiling. A higher round trip counts as a queue only if the stream could be filling it (it uses a
+  third of its target, or the path delivers less than it sends), so a tunnel's drifting latency
+  does not drag the target down. While the link is clear the target climbs, fast at first,
+  carefully near the ceiling, and only while the content uses what it has.
 - **Sharp text after motion.** Once the screen has been still for 120 ms (and input has paused for
-  300 ms), up to three refinement frames re-encode the image with a lower QP, one at a time, each
-  after the previous frame was acknowledged.
+  300 ms), three refinement frames re-encode the image with a lower QP, one at a time, each after
+  the previous frame was acknowledged: by 16, 24 and 32 on NVENC's QP map, where a page of text
+  settles near 39 dB, and by 4, 8 and 8 through FFmpeg's region-of-interest offsets, whose rate
+  control makes up for larger ones.
 - **Client-side cursor.** The cursor travels as metadata, never burned into the video. The browser
   shows it as a CSS cursor with the real shape, so pointer motion has no network latency at all.
   On a phone it is drawn as a sprite you steer like a trackpad.
@@ -464,6 +508,9 @@ pnpm install && pnpm test        # ticket interop between the Node minter and th
 skylight bench                   # encoder speed and still-image quality on this machine
 node scripts/bench.mjs           # end to end in Chromium: latency, frame rate, bandwidth
 node scripts/bench.mjs --base https://desk.example.com/   # the same through your public URL
+node scripts/bench.mjs --connects 7   # time to the first frame, and back after a dropped socket
+node scripts/bench.mjs --motion follow   # dragging: frame pacing, frames never shown, repeats
+node scripts/bench.mjs --quality 8 --mbps 16   # a page of text after a change, against /api/screenshot
 ./scripts/final-bench.sh         # all of the above plus server RSS, into docs/results/
                                  # (set SKYLIGHT_PUBLIC_URL to include the public run)
 node scripts/screenshots.mjs     # the viewer screenshots in docs/results/
@@ -475,12 +522,15 @@ scripts/testbed.sh start         # a second server on a virtual X display, with 
 SKYLIGHT_ENCODER=software scripts/testbed.sh start   # the same, forced onto one encoder family
 scripts/link-bench.sh out/       # against it: loopback, a 47 ms path, 10 and 5 Mbit/s links
 node scripts/netem.mjs --rtt 60 --mbps 5   # just the emulated link, in front of any server
+node scripts/netem.mjs --rtt 45 --swing 35:4000 --kill /input:600 --hang /ws:3000
+                                 # a tunnel whose latency drifts and whose sockets die
 ```
 
 The browser scripts need Chromium at `/usr/bin/chromium` and the service's private key at
 `~/.config/skylight/ticket-private.pem` (or `--key`); tickets use the hostname as `aud` unless
 you pass `--aud`. `bench.mjs --jank 25` keeps the page's thread busy 25 ms out of every 50, and
-`--no-worker` decodes on it, for comparing the two. [docs/PROTOCOL.md](docs/PROTOCOL.md)
+`--no-worker` decodes on it, for comparing the two; `--no-smooth` draws every frame the moment it
+is decoded. With `--server-pid` (and `--x-pid` for the X server) it also reports CPU use. [docs/PROTOCOL.md](docs/PROTOCOL.md)
 documents the wire format.
 
 ## Not done yet

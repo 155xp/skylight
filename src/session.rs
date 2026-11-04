@@ -727,16 +727,21 @@ async fn start_probe(
 const REFINE_AFTER: Duration = Duration::from_millis(120);
 /// ...and at least this long after the last input event (µs).
 const REFINE_QUIET_US: u64 = 300_000;
-const REFINE_FRAMES: u8 = 3;
 
-/// How much to lower the QP of refinement frame `n` (0-based), where the encoder allows it.
-pub fn refine_sharpen(n: u8) -> u8 {
-    let v: Vec<u8> = std::env::var("SKYLIGHT_SHARPEN")
-        .unwrap_or_else(|_| "4,8,8".into())
-        .split(',')
-        .filter_map(|x| x.parse().ok())
-        .collect();
-    v.get(n as usize).copied().unwrap_or(0)
+/// How much each refinement frame lowers the QP on this encoder (see [`encode::Caps::refine`]),
+/// one entry per refinement frame. `SKYLIGHT_SHARPEN` (comma-separated) overrides it, for
+/// experiments.
+pub fn refine_steps(caps: encode::Caps) -> &'static [u8] {
+    static OVERRIDE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    let o = OVERRIDE.get_or_init(|| {
+        std::env::var("SKYLIGHT_SHARPEN")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+    });
+    match o {
+        Some(v) => &v[..v.len().min(16)],
+        None => caps.refine,
+    }
 }
 
 struct Stats {
@@ -1203,10 +1208,14 @@ fn encoder_loop(
         last_encode = pull_slot.take().unwrap_or(t0);
         let queue_us = clock::now_us().saturating_sub(r.capture_us);
         payload.clear();
+        let steps = refine_steps(e.caps());
         let opts = FrameOpts {
             keyframe: need_key,
             sharpen: if refine {
-                refine_sharpen(REFINE_FRAMES - refine_left)
+                steps
+                    .get(steps.len().saturating_sub(refine_left as usize))
+                    .copied()
+                    .unwrap_or(0)
             } else {
                 0
             },
@@ -1242,7 +1251,7 @@ fn encoder_loop(
             refine_left -= 1;
             stats.refines += 1;
         } else {
-            refine_left = REFINE_FRAMES;
+            refine_left = steps.len() as u8;
             last_content = Instant::now();
             timeout = REFINE_AFTER;
         }

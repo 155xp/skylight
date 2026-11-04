@@ -115,7 +115,17 @@ pub struct Caps {
     /// direct). x264 applies a new budget only from the next frame, so it gets the boost for its
     /// first keyframe only, by opening with it; the others have to start at their normal budget.
     pub keyframe_boost: bool,
+    /// How much each refinement frame lowers the QP, one entry per frame (where `sharpen`).
+    /// NVENC's QP map takes large offsets well: each refinement spends up to the VBV cap and text
+    /// comes out sharp (a page of text settles near 39 dB instead of 19-24 dB). Through FFmpeg's
+    /// region-of-interest offsets, the encoder's rate control raises the frame's QP to make up for
+    /// large ones and draws down its buffer, which starves the next change, so they stay mild.
+    pub refine: &'static [u8],
 }
+
+/// Refinement QP offsets for NVENC's QP map and for FFmpeg's region-of-interest offsets.
+const REFINE_QP_MAP: &[u8] = &[16, 24, 32];
+const REFINE_ROI: &[u8] = &[4, 8, 8];
 
 impl Caps {
     /// The capabilities of an encoder, by name ("nvenc" is the direct NVENC path).
@@ -133,6 +143,11 @@ impl Caps {
             rate,
             sharpen,
             keyframe_boost,
+            refine: if name == "nvenc" {
+                REFINE_QP_MAP
+            } else {
+                REFINE_ROI
+            },
         }
     }
 }
@@ -898,6 +913,10 @@ mod tests {
             (RateChange::InPlace, true, false)
         );
         assert_eq!(Caps::of("libopenh264", false).rate, RateChange::Reopen);
+        // Strong refinement only where it is a QP map; every encoder refines three times.
+        assert_eq!(Caps::of("nvenc", true).refine, [16, 24, 32]);
+        assert_eq!(Caps::of("libx264", false).refine, [4, 8, 8]);
+        assert_eq!(Caps::of("h264_vaapi", false).refine.len(), 3);
     }
 
     #[test]

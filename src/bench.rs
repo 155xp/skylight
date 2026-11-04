@@ -174,16 +174,15 @@ pub fn run(
         buf[y * stride..y * stride + w as usize * 4]
             .copy_from_slice(&img[y * w as usize * 4..(y + 1) * w as usize * 4]);
     }
-    for (i, label) in ["change", "refine 1", "refine 2", "refine 3"]
-        .iter()
-        .enumerate()
-    {
-        stream.clear();
-        let sharpen = if i == 0 {
-            0
+    let steps = crate::session::refine_steps(enc.caps());
+    for i in 0..=steps.len() {
+        let label = if i == 0 {
+            "change".to_string()
         } else {
-            crate::session::refine_sharpen(i as u8 - 1)
+            format!("refine {i}")
         };
+        stream.clear();
+        let sharpen = if i == 0 { 0 } else { steps[i - 1] };
         enc.encode_with(
             crate::nvenc::FrameOpts {
                 keyframe: false,

@@ -555,7 +555,6 @@ export class Skylight extends EventTarget {
         try {
           if (!ticket) ticket = typeof this.opts.ticket === 'function' ? await this.opts.ticket() : this.opts.ticket;
           await this._open(url, ticket);
-          this.retry = 0;
           return;
         } catch (e) {
           lastErr = e;
@@ -1024,9 +1023,14 @@ export class Skylight extends EventTarget {
     });
   }
 
+  /**
+   * The first try after a working stream drops goes at once: through a tunnel that is usually a
+   * blip, and the next connection works. Later tries back off. `retry` only starts over once a new
+   * connection shows a frame, so a session that fails right after its welcome backs off too.
+   */
   _scheduleReconnect() {
     if (!this.opts.reconnect || this._closing || typeof this.opts.ticket !== 'function') return;
-    const delay = [500, 1000, 2000, 5000, 10000][Math.min(this.retry++, 4)];
+    const delay = [0, 500, 1000, 2000, 5000, 10000][Math.min(this.retry++, 5)];
     clearTimeout(this._reconnectTimer);
     this._reconnectTimer = setTimeout(() => this.connect(), delay);
   }
@@ -1254,6 +1258,7 @@ export class Skylight extends EventTarget {
         break;
       }
       case 'frame': {
+        this.retry = 0;
         const now = local(m.decoded);
         const recv = local(m.recv);
         const w = this.win;

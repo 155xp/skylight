@@ -145,7 +145,7 @@ the search to one family.
 | NVENC, driven directly (`nvenc-h264` etc.) | NVIDIA | in place | QP offset map | every forced keyframe |
 | NVENC through FFmpeg (`h264_nvenc`) | NVIDIA | cost a keyframe, so only big moves, at most every 3 s | no | no |
 | VA-API through FFmpeg (`h264_vaapi`) | Intel, AMD | reopen (a keyframe), so only big moves, at most every 3 s | region-of-interest QP offset, where the driver supports ROI | no |
-| x264 | none | in place | region-of-interest QP offset | first keyframe |
+| x264 | none | in place | region-of-interest QP offset, and a budget of their own | first keyframe |
 | OpenH264, x265, SVT-AV1 | none | reopen, as VA-API | x265 only | no |
 
 All of them run with no B-frames, no lookahead, no scene-cut keyframes, an infinite GOP

@@ -101,15 +101,21 @@ impl Pacer {
         self.inflight.len()
     }
 
-    pub fn on_send(&mut self, id: u32, bytes: usize, now_us: u64) {
+    /// A frame went out. A refinement (`refine`) is in flight like any frame, but it is not
+    /// part of what the content sends: it goes only once the screen is still and spends what a
+    /// sharp picture needs, so it says nothing about whether frames fit the bitrate, nor about
+    /// whether the stream is what fills a queue.
+    pub fn on_send(&mut self, id: u32, bytes: usize, refine: bool, now_us: u64) {
         self.first_send_us.get_or_insert(now_us);
         self.inflight.push_back(Sent {
             id,
             bytes: bytes as u32,
             at_us: now_us,
         });
-        self.sent.push_back((now_us, bytes as u32));
-        trim(&mut self.sent, now_us, RATE_WINDOW_US);
+        if !refine {
+            self.sent.push_back((now_us, bytes as u32));
+            trim(&mut self.sent, now_us, RATE_WINDOW_US);
+        }
     }
 
     /// Returns the round trip for `id`, if it was in flight.
@@ -354,12 +360,12 @@ mod tests {
     #[test]
     fn acks_measure_rtt_and_free_the_window() {
         let mut p = Pacer::new(10_000_000, 1_000_000, 50_000_000, 60);
-        p.on_send(1, 1000, 0);
-        p.on_send(2, 1000, 16_000);
+        p.on_send(1, 1000, false, 0);
+        p.on_send(2, 1000, false, 16_000);
         assert_eq!(p.on_ack(1, 5_000), Some(5_000));
         assert_eq!(p.inflight(), 1);
         // Acking 3 when 2 was never acked clears both.
-        p.on_send(3, 1000, 32_000);
+        p.on_send(3, 1000, false, 32_000);
         assert_eq!(p.on_ack(3, 40_000), Some(8_000));
         assert_eq!(p.inflight(), 0);
         assert_eq!(p.min_rtt_us, 5_000);
@@ -368,9 +374,9 @@ mod tests {
     #[test]
     fn blocks_when_frames_queue_up() {
         let mut p = Pacer::new(10_000_000, 1_000_000, 50_000_000, 60);
-        p.on_send(1, 1000, 0);
+        p.on_send(1, 1000, false, 0);
         p.on_ack(1, 4_000); // 4 ms round trip
-        p.on_send(2, 50_000, 10_000);
+        p.on_send(2, 50_000, false, 10_000);
         assert!(p.can_send(20_000));
         // 4 ms + max(2 frames, 60 ms, rtt) = 64 ms allowance; at 70 ms the oldest frame is stuck.
         assert!(p.can_send(70_000));
@@ -386,7 +392,7 @@ mod tests {
         let mut t = 0;
         // Clear link, content that uses the bitrate (40 kB per 16 ms is 20 Mbit/s): it climbs.
         for id in 0..40 {
-            p.on_send(id, 40_000, t);
+            p.on_send(id, 40_000, false, t);
             p.on_ack(id, t + 5_000);
             t += 16_000;
             p.adjust(t);
@@ -395,7 +401,7 @@ mod tests {
         let high = p.target_bps;
         // Queueing: round trips grow to 200 ms and stay there (a standing queue, two seconds).
         for id in 40..165 {
-            p.on_send(id, 40_000, t);
+            p.on_send(id, 40_000, false, t);
             p.on_ack(id, t + 200_000);
             t += 16_000;
             p.adjust(t);
@@ -410,7 +416,7 @@ mod tests {
         // The rate that got through is remembered: recovery approaches it carefully.
         let ceiling = p.ceiling.expect("a ceiling after congestion").0;
         for id in 165..285 {
-            p.on_send(id, 40_000, t);
+            p.on_send(id, 40_000, false, t);
             p.on_ack(id, t + 5_000);
             t += 16_000;
             p.adjust(t);
@@ -439,7 +445,7 @@ mod tests {
                 x as u64 % 30_000
             };
             let bytes = (p.target_bps / 8 / 60) as usize;
-            p.on_send(id, bytes, t);
+            p.on_send(id, bytes, false, t);
             assert!(p.can_send(t + 1) || p.inflight() > 0);
             p.on_ack(id, t + 40_000 + jitter);
             t += 16_667;
@@ -457,7 +463,7 @@ mod tests {
         for id in 0..1200u32 {
             let phase = (t % 4_000_000) as f64 / 4_000_000.0 * std::f64::consts::TAU;
             let rtt = 45_000 + (17_500.0 * (1.0 - phase.cos())) as u64;
-            p.on_send(id, 3_100, t);
+            p.on_send(id, 3_100, false, t);
             p.on_ack(id, t + rtt);
             t += 16_667;
             p.adjust(t);
@@ -473,7 +479,7 @@ mod tests {
         let mut link_free = 0u64;
         for id in 0..600u32 {
             let bytes = 6_250; // 3 Mbit/s at 60 fps
-            p.on_send(id, bytes, t);
+            p.on_send(id, bytes, false, t);
             // The bottleneck delivers 2 Mbit/s (250 bytes per ms) behind a 20 ms base trip.
             link_free = link_free.max(t) + bytes as u64 * 1000 / 250;
             p.on_ack(id, link_free + 20_000);
@@ -504,7 +510,7 @@ mod tests {
             }
             if p.can_send(t) {
                 let bytes = p.target_bps / 8 / 60;
-                p.on_send(id, bytes as usize, t);
+                p.on_send(id, bytes as usize, false, t);
                 // 375 bytes per ms, behind a 30 ms round trip.
                 link_free = link_free.max(t) + bytes * 1000 / 375;
                 acks.push_back((link_free + 30_000, id));
@@ -540,14 +546,14 @@ mod tests {
                 p.on_ack(i, at);
             }
             let frames = if t == 16_667 * 60 {
-                vec![200_000; 3]
+                vec![(200_000, true); 3]
             } else if t > 16_667 * 66 && p.can_send(t) {
-                vec![p.target_bps / 8 / 60]
+                vec![(p.target_bps / 8 / 60, false)]
             } else {
                 vec![]
             };
-            for bytes in frames {
-                p.on_send(id, bytes as usize, t);
+            for (bytes, refine) in frames {
+                p.on_send(id, bytes as usize, refine, t);
                 // 375 bytes per ms, behind a 30 ms round trip.
                 link_free = link_free.max(t) + bytes * 1000 / 375;
                 acks.push_back((link_free + 30_000, id));
@@ -559,6 +565,44 @@ mod tests {
         }
         assert!(lowest > 1_000_000, "target fell to {lowest}");
         assert!(p.target_bps > 2_000_000, "target {}", p.target_bps);
+    }
+
+    #[test]
+    fn big_refinements_do_not_make_light_content_look_too_big() {
+        // A fast link and light content (clicks), each change followed by refinement frames of
+        // a few hundred kB that take the viewer 80 ms to decode, holding the next frames back.
+        let mut p = Pacer::new(16_000_000, 250_000, 50_000_000, 60);
+        let (mut t, mut busy, mut id) = (0u64, 0u64, 0u32);
+        let mut acks = VecDeque::new();
+        while t < 10_000_000 {
+            while acks.front().is_some_and(|(at, _)| *at <= t) {
+                let (at, i) = acks.pop_front().unwrap();
+                p.on_ack(i, at);
+            }
+            let phase = t % 600_000;
+            let frame = if phase < 100_000 {
+                Some((2_000, false, 5_000))
+            } else if (150_000..200_000).contains(&phase) {
+                Some((300_000, true, 80_000))
+            } else {
+                None
+            };
+            if let Some((bytes, refine, decode)) = frame
+                && p.can_send(t)
+            {
+                p.on_send(id, bytes, refine, t);
+                busy = busy.max(t) + decode;
+                acks.push_back((busy, id));
+                id += 1;
+            }
+            t += 16_667;
+            p.adjust(t);
+        }
+        assert!(
+            p.target_bps >= 13_000_000,
+            "target fell to {}",
+            p.target_bps
+        );
     }
 
     #[test]
@@ -579,7 +623,7 @@ mod tests {
                 p.on_ack(i, at);
             }
             if p.can_send(t) {
-                p.on_send(id, (p.target_bps / 8 / 60) as usize, t);
+                p.on_send(id, (p.target_bps / 8 / 60) as usize, false, t);
                 decoder_free = decoder_free.max(t + 5_000) + 25_000;
                 acks.push_back((decoder_free, id));
                 id += 1;
@@ -597,7 +641,7 @@ mod tests {
         let mut p = Pacer::new(8_000_000, 1_000_000, 50_000_000, 60);
         let mut t = 0;
         for id in 0..300 {
-            p.on_send(id, 2_000, t);
+            p.on_send(id, 2_000, false, t);
             p.on_ack(id, t + 5_000);
             t += 16_000;
             p.adjust(t);
@@ -608,11 +652,11 @@ mod tests {
     #[test]
     fn window_holds_the_allowance_worth_of_frames() {
         let mut p = Pacer::new(10_000_000, 1_000_000, 50_000_000, 100);
-        p.on_send(0, 1000, 0);
+        p.on_send(0, 1000, false, 0);
         p.on_ack(0, 2_000); // 2 ms round trip: (2 + 60) / 10 + 2 = 8 frames
         for id in 1..=8 {
             assert!(p.can_send(id as u64 * 1_000), "frame {id}");
-            p.on_send(id, 1000, id as u64 * 1_000);
+            p.on_send(id, 1000, false, id as u64 * 1_000);
         }
         assert!(!p.can_send(9_000));
     }
@@ -620,7 +664,7 @@ mod tests {
     #[test]
     fn a_viewer_that_stops_acking_is_not_waited_for_forever() {
         let mut p = Pacer::new(10_000_000, 1_000_000, 50_000_000, 60);
-        p.on_send(1, 1000, 0);
+        p.on_send(1, 1000, false, 0);
         assert!(!p.stalled(1_000_000));
         assert!(!p.can_send(1_000_000));
         assert!(p.stalled(STALL_US + 1));
@@ -633,7 +677,7 @@ mod tests {
         let mut p = Pacer::new(10_000_000, 1_000_000, 40_000_000, 60);
         let mut t = 0;
         for id in 0..120 {
-            p.on_send(id, 20_000, t);
+            p.on_send(id, 20_000, false, t);
             p.on_ack(id, t + 50_000 + (id as u64 % 6) * 5_000);
             t += 16_000;
             p.adjust(t);

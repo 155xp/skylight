@@ -175,6 +175,8 @@ pub struct VideoEncoder {
     stale: Vec<bool>,
     /// The caller took `input()` without saying what it changed: convert the whole frame.
     whole: bool,
+    /// x264 runs with the refinement budget (`REFINE_BPS`).
+    refining: bool,
     hw_device: *mut ff::AVBufferRef,
     pkt: *mut ff::AVPacket,
     pts: i64,
@@ -190,6 +192,14 @@ pub struct VideoEncoder {
 
 // The raw pointers are owned exclusively by this struct and only touched from one thread at a time.
 unsafe impl Send for VideoEncoder {}
+
+/// x264's bitrate while it sends refinement frames, so their cap is what a sharp picture needs...
+const REFINE_BPS: u64 = 128_000_000;
+/// ...but no frame may take longer than this at the target bitrate (ms): on a slow link a
+/// refinement would otherwise hold the next input's answer back for many seconds, and outlast
+/// the pacer's stall timeout. (A second, at 4 Mbit/s, is on the edge where a page of text no
+/// longer comes out sharp.)
+const REFINE_MAX_MS: u64 = 2000;
 
 /// Rows per band in the partial colour conversion (even, for 4:2:0 chroma).
 const BAND: u32 = 16;
@@ -341,6 +351,7 @@ impl VideoEncoder {
                 band_sws: ptr::null_mut(),
                 stale: Vec::new(),
                 whole: true,
+                refining: false,
                 hw_device: ptr::null_mut(),
                 pkt: ptr::null_mut(),
                 pts: 0,
@@ -379,6 +390,7 @@ impl VideoEncoder {
             band_sws: ptr::null_mut(),
             stale: Vec::new(),
             whole: true,
+            refining: false,
             hw_device: ptr::null_mut(),
             pkt: ptr::null_mut(),
             pts: 0,
@@ -761,6 +773,26 @@ impl VideoEncoder {
                 frame,
                 ff::AVFrameSideDataType::AV_FRAME_DATA_REGIONS_OF_INTEREST,
             );
+            if self.name == "libx264" {
+                // Refinement frames take what a sharp picture needs, as NVENC's do: under the
+                // usual cap x264 keeps the parts of the old picture it skipped while the change
+                // was squeezed in (a page of text settled near 20 dB), and its rate control
+                // spends little more however low the QP offsets go. Normal frames get the normal
+                // cap back. (Only `bit_rate` and the VBV change, so `REFINE_MAX_MS` bounds the
+                // frame through the VBV size.)
+                let b = self.bitrate;
+                if sharpen > 0 {
+                    // x264 makes its buffer at least one frame long.
+                    let buffer_ms = self.vbv_ms.max(1000u32.div_ceil(self.fps)) as u64;
+                    let longest = b * REFINE_MAX_MS / buffer_ms;
+                    self.apply_rate(REFINE_BPS.min(longest).max(b));
+                    self.bitrate = b;
+                    self.refining = true;
+                } else if self.refining {
+                    self.apply_rate(b);
+                    self.refining = false;
+                }
+            }
             if sharpen > 0 && self.caps.sharpen {
                 // The whole frame as one region with a negative QP offset (as a fraction of the
                 // QP range, which FFmpeg's wrappers map onto each encoder's scale).
@@ -1139,6 +1171,73 @@ mod tests {
         noise(&mut enc, 1);
         assert!(enc.encode(true, &mut out).unwrap());
         assert!(out.len() < normal_vbv * 2, "keyframe {} B", out.len());
+    }
+
+    #[test]
+    fn x264_refinements_spend_more_and_the_next_change_is_capped_again() {
+        // 1 Mbit/s with a 34 ms VBV: a normal frame may be about 4 kB.
+        let mut enc = software(640, 360, 1_000_000, Some(23));
+        let normal_vbv = 1_000_000 / 8 * 34 / 1000;
+        let mut out = Vec::new();
+        noise(&mut enc, 1);
+        enc.encode(true, &mut out).unwrap();
+        noise(&mut enc, 2);
+        out.clear();
+        enc.encode(false, &mut out).unwrap();
+        let mut refined = 0;
+        for sharpen in [4, 8, 8] {
+            out.clear();
+            let opts = FrameOpts {
+                keyframe: false,
+                sharpen,
+            };
+            enc.encode_with(opts, &mut out).unwrap();
+            refined += out.len();
+        }
+        assert!(refined > normal_vbv * 6, "refinements {refined} B");
+        for seed in 3..6 {
+            noise(&mut enc, seed);
+            out.clear();
+            enc.encode(false, &mut out).unwrap();
+            assert!(out.len() < normal_vbv * 2, "change {seed}: {} B", out.len());
+        }
+    }
+
+    #[test]
+    fn x264_refinements_on_a_slow_link_take_at_most_two_seconds_each() {
+        // 250 kbit/s: a refinement of a detailed picture may be at most about 62 kB, at any
+        // frame rate (x264 makes its buffer at least a frame long).
+        for fps in [60, 10] {
+            let p = EncoderParams {
+                width: 1280,
+                height: 720,
+                fps,
+                bitrate: 250_000,
+                vbv_ms: 34,
+                backend: Backend::Software,
+                ..Default::default()
+            };
+            let mut enc = VideoEncoder::open_named("libx264", &p).unwrap();
+            let mut out = Vec::new();
+            noise(&mut enc, 1);
+            enc.encode(true, &mut out).unwrap();
+            noise(&mut enc, 2);
+            out.clear();
+            enc.encode(false, &mut out).unwrap();
+            for sharpen in [4, 8, 8] {
+                out.clear();
+                let opts = FrameOpts {
+                    keyframe: false,
+                    sharpen,
+                };
+                enc.encode_with(opts, &mut out).unwrap();
+                assert!(
+                    out.len() < 250_000 / 8 * 2 * 5 / 4,
+                    "{fps} fps: refinement {} B",
+                    out.len()
+                );
+            }
+        }
     }
 
     #[test]

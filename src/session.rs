@@ -1377,7 +1377,7 @@ fn encoder_loop(
         sh.pacer
             .lock()
             .unwrap()
-            .on_send(frame_id, msg.len(), clock::now_us());
+            .on_send(frame_id, msg.len(), refine, clock::now_us());
         if !key && !refine {
             frame_bits += (msg.len() as f64 * 8.0 - frame_bits) / 8.0;
         }

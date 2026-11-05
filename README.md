@@ -299,6 +299,34 @@ presses and the latency of motion are otherwise unchanged: through a tunnel they
 network, the server's share being about 3 ms. The sharper page spends its bytes while the screen is
 still.
 
+### Test bed: slow links, first frames and software encoding
+
+The round after that, measured the same way against the release before it, both built from source.
+"3 Mbit/s" is `netem.mjs --rtt 60 --mbps 3 --queue-ms 1000` and "1 Mbit/s" `--rtt 80 --mbps 1
+--queue-ms 1000`, each with 15 clicks before 10 s of scrolling text (`--modes click --motion
+scroll`); NVENC's 1 Mbit/s figures are medians of three runs, as that link varies most. First frames show
+a desktop screenshot full screen (`--connects 3`, medians); the page of text is `--quality 4`.
+
+| | Before | After |
+|---|---|---|
+| Scrolling, 3 Mbit/s (NVENC): frames/s, glass to glass p95, interval jitter | 43, 205 ms, 26 ms | **54, 48 ms, 6 ms** |
+| Scrolling, 3 Mbit/s (x264): frames/s, interval jitter | 41, 20 ms | **56, 4 ms** |
+| Scrolling, 1 Mbit/s (NVENC): frames/s, glass to glass p95, interval jitter | 18, 532 ms, 78 ms | **43, 114 ms, 30 ms** |
+| Scrolling, 1 Mbit/s (x264): frames/s, interval jitter | 29, 55 ms | **49, 6 ms** |
+| First frame of a new connection, 1 Mbit/s / 3 Mbit/s | 1424 / 577 ms | **543 / 278 ms** |
+| Back after a dropped connection, 1 Mbit/s / 3 Mbit/s | 1495 / 634 ms | **614 / 335 ms** |
+| A page of text after a change, once settled (x264), 16 / 4 Mbit/s | 20.9 / 11.6 dB | **39.9 / 39.8 dB** |
+| x264 under animation over loopback: encode, glass to glass | 3.4 ms, 5.5 ms | **2.4 ms, 4.4 ms** |
+
+NVENC over loopback, the jittery tunnel and NVENC's page of text (39.1 dB) are unchanged. What changed: frames
+too big for a slow link now count as congestion, so the bitrate comes down to the link instead of
+the frame rate halving; frames that still cost more than a frame interval at that bitrate go out
+evenly as often as it carries them; a new connection's first keyframe gets the usual budget until
+the link has been measured, and a reconnect starts at the bitrate the last session settled on;
+x264's refinement frames get the budget a sharp picture needs (at most two seconds of the link);
+and software encoding converts only the rows that changed. The glass figures for x264 on slow links
+are missing because the bench cannot read its time code out of x264's picture at those bitrates.
+
 The rest of this section was measured with the previous release on a real KDE Plasma desktop.
 
 ### Input to photon

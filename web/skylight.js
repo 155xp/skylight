@@ -61,6 +61,13 @@ const isApple = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.user
 /** A connection that brings nothing for this long (ms) is dead (see Skylight._abandon). */
 const SILENT_SERVER_MS = 4000;
 
+// Where the last bitrate for a server is kept: its host and path, never a query (which may hold
+// a credential).
+function rateKey(url) {
+  const u = new URL(url, location.href);
+  return `skylight:rate:${u.host}${u.pathname}`;
+}
+
 function median(a) {
   if (!a.length) return 0;
   const s = [...a].sort((x, y) => x - y);
@@ -1060,6 +1067,17 @@ export class Skylight extends EventTarget {
     this.dispatchEvent(new CustomEvent('state', { detail: { state, detail } }));
   }
 
+  // The bitrate the server last settled on for this URL: a reconnect, or the next visit, starts
+  // there, so its first keyframe is sized for the link rather than for a fast one.
+  _rateHint(url) {
+    if (this._rate && this._rate.url === url) return this._rate.bps;
+    try {
+      return Number(localStorage.getItem(rateKey(url))) || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   _open(url, ticket) {
     return new Promise((resolve, reject) => {
       const ws = this.worker ? (this._wsock = new WorkerSocket(this.worker, url, ++this._sockets)) : new WebSocket(url);
@@ -1083,6 +1101,7 @@ export class Skylight extends EventTarget {
           codecs: this.opts.codecs,
           maxFps: this.opts.maxFps || this.refreshHz || 60,
           maxBitrate: this.opts.maxBitrate,
+          startBitrate: this._rateHint(url),
           monitor: this.opts.monitor,
         }));
       };
@@ -1304,6 +1323,12 @@ export class Skylight extends EventTarget {
         break;
       case 'stats':
         this.serverStats = m;
+        if (m.targetKbps > 0) {
+          this._rate = { url: this._url, bps: m.targetKbps * 1000 };
+          try {
+            localStorage.setItem(rateKey(this._url), String(this._rate.bps));
+          } catch {}
+        }
         break;
       case 'clipboard':
         this._onRemoteClipboard(m.text);

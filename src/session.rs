@@ -281,6 +281,7 @@ pub async fn run(socket: WebSocket, app: Arc<App>) {
         max_fps,
         monitor,
         max_bitrate,
+        start_bitrate,
     }) = hello
     else {
         let _ = sink
@@ -324,6 +325,7 @@ pub async fn run(socket: WebSocket, app: Arc<App>) {
         max_fps,
         monitor,
         max_bitrate,
+        start_bitrate,
     )
     .await;
     app.sessions.fetch_sub(1, Ordering::SeqCst);
@@ -352,6 +354,7 @@ async fn serve(
     max_fps: Option<u32>,
     monitor: Option<String>,
     max_bitrate: Option<u64>,
+    start_bitrate: Option<u64>,
 ) -> anyhow::Result<()> {
     let wanted_mon = claims.mon.clone().or(monitor);
     let mut mon = app.hub.resolve(wanted_mon.as_deref())?;
@@ -427,7 +430,7 @@ async fn serve(
         sig: Signal::new(),
         cmds: Mutex::new(VecDeque::new()),
         pacer: Mutex::new(Pacer::new(
-            app.config.start_bitrate,
+            start_bitrate.unwrap_or(app.config.start_bitrate),
             app.config.min_bitrate,
             max_bps,
             fps,

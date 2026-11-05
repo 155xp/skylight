@@ -180,6 +180,9 @@ pub enum ClientMsg {
         monitor: Option<String>,
         #[serde(default, rename = "maxBitrate")]
         max_bitrate: Option<u64>,
+        /// Where the last session to this server settled (bit/s), to start from instead.
+        #[serde(default, rename = "startBitrate")]
+        start_bitrate: Option<u64>,
     },
     Ping {
         id: u64,
@@ -335,13 +338,15 @@ mod tests {
 
     #[test]
     fn hello_parses() {
-        let m: ClientMsg =
-            serde_json::from_str(r#"{"t":"hello","ticket":"x","codecs":["h264"],"maxFps":120}"#)
-                .unwrap();
+        let m: ClientMsg = serde_json::from_str(
+            r#"{"t":"hello","ticket":"x","codecs":["h264"],"maxFps":120,"startBitrate":2400000}"#,
+        )
+        .unwrap();
         assert!(matches!(
             m,
             ClientMsg::Hello {
                 max_fps: Some(120),
+                start_bitrate: Some(2_400_000),
                 ..
             }
         ));

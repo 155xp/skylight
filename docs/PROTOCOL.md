@@ -10,10 +10,12 @@ Binary messages are little-endian. Control messages are JSON text frames with a 
 1. The client opens the socket and sends, within 5 seconds:
    ```json
    {"t":"hello","ticket":"sk1....","codecs":["h264","hevc","av1"],"maxFps":120,
-    "maxBitrate":20000000,"monitor":"HDMI-A-1"}
+    "maxBitrate":20000000,"startBitrate":2400000,"monitor":"HDMI-A-1"}
    ```
    Only `ticket` is required. `codecs` is in preference order; the server takes the first one
-   it can encode. `maxFps` should be the display's refresh rate.
+   it can encode. `maxFps` should be the display's refresh rate. `startBitrate` is where the
+   bitrate controller starts (bits per second, within the server's limits): the target the
+   last session to this server settled on, so a slow link's first keyframe is sized for it.
 2. The server verifies the ticket (see the README) and answers:
    ```json
    {"t":"welcome","server":"skylight 0.1.0","backend":"kde","session":"Ab3dE6gH",

@@ -123,7 +123,10 @@ with `detail.issue` (`decoder-stall`, `black-output`, `no-video`) and a sentence
 left to try (no picture 8 s after connecting, or still black with the software decoder): a page
 with a second transport can switch to it then.
 
-The module draws no chrome of its own, so your app keeps its own toolbar and frame.
+The module draws no chrome of its own, so your app keeps its own toolbar and frame. It keeps one
+thing in `localStorage`: the bitrate the server last settled on, under
+`skylight:rate:<host><path>` of the socket URL, so that a reconnect or the next visit over a slow
+link starts there instead of at the server's default.
 
 ### Content Security Policy
 

@@ -18,7 +18,8 @@
 //!   a stream that uses little of its target, is not slowed down by cutting that target. While
 //!   the link is clear it climbs: fast at first, carefully near the ceiling, then probing gently
 //!   above it. It only climbs while the content uses the bitrate it has; a still screen says
-//!   nothing about the path.
+//!   nothing about the path. Frames that use their whole budget and still have to be held back
+//!   much of the time count as congestion, whatever the round trip says.
 
 use std::collections::VecDeque;
 
@@ -45,6 +46,12 @@ pub struct Pacer {
     ceiling: Option<(u64, u64)>,
     slow_start: bool,
     blocked_since_us: Option<u64>,
+    /// Spans of time frames were held back (end, start), over the last second.
+    held: VecDeque<(u64, u64)>,
+    first_send_us: Option<u64>,
+    /// The delivered rate at the last cut for frames held back, and when it was, while they still
+    /// are.
+    hold_cut: Option<(u64, u64)>,
     pub skipped: u64,
     pub stalls: u64,
 }
@@ -82,6 +89,9 @@ impl Pacer {
             ceiling: None,
             slow_start: true,
             blocked_since_us: None,
+            held: VecDeque::new(),
+            first_send_us: None,
+            hold_cut: None,
             skipped: 0,
             stalls: 0,
         }
@@ -92,6 +102,7 @@ impl Pacer {
     }
 
     pub fn on_send(&mut self, id: u32, bytes: usize, now_us: u64) {
+        self.first_send_us.get_or_insert(now_us);
         self.inflight.push_back(Sent {
             id,
             bytes: bytes as u32,
@@ -172,7 +183,10 @@ impl Pacer {
             }
         };
         if ok {
-            self.blocked_since_us = None;
+            if let Some(since) = self.blocked_since_us.take() {
+                self.held.push_back((now_us, since));
+                trim(&mut self.held, now_us, RATE_WINDOW_US);
+            }
         } else if self.blocked_since_us.is_none() {
             self.blocked_since_us = Some(now_us);
             self.skipped += 1;
@@ -211,6 +225,26 @@ impl Pacer {
         rate(&self.sent, now_us)
     }
 
+    /// Whether frames were held back for more than a fifth of the time over the last second,
+    /// or since the last cut if that was more recent, so that one cut is seen through before
+    /// the next. `None` until there is `CUT_EVERY_US` to judge from.
+    fn held_much(&self, now_us: u64) -> Option<bool> {
+        let from = now_us
+            .saturating_sub(RATE_WINDOW_US)
+            .max(self.last_cut_us)
+            .max(self.first_send_us.unwrap_or(now_us));
+        let span = now_us - from.min(now_us);
+        let ongoing = self.blocked_since_us.map(|s| (now_us, s));
+        let held: u64 = self
+            .held
+            .iter()
+            .copied()
+            .chain(ongoing)
+            .map(|(e, s)| e.saturating_sub(s.max(from)))
+            .sum();
+        (span >= CUT_EVERY_US).then_some(held * 5 > span)
+    }
+
     /// Move the bitrate target; returns the new target when it changed.
     pub fn adjust(&mut self, now_us: u64) -> Option<u64> {
         if now_us < self.last_adjust_us + ADJUST_EVERY_US {
@@ -235,21 +269,48 @@ impl Pacer {
         let (sent, delivered) = (self.sent_bps(now_us), self.delivery_bps(now_us));
         // Whether a queue could be this stream's own doing (see the module comment).
         let ours = sent * 3 >= self.target_bps || delivered * 10 < sent * 8;
+        // Frames held back for a fifth of the last second while each uses most of its budget:
+        // they are bigger than the link carries at this frame rate. Holding them keeps the queue
+        // short, so the round trip may never show it, and keeps what is sent down to what gets
+        // through, so the stream never looks like it sends much; the frame rate pays instead. (A
+        // tunnel's rare stall holds frames far less, and light content leaves its budget unused.)
+        let held = self.held_much(now_us);
+        let frames = self.sent.len() as u64;
+        let full_frames =
+            frames > 0 && sent / frames * 2 * 1_000_000 >= self.target_bps * self.frame_interval_us;
+        // A cut for them has to have helped before the next: a slow link delivers as much after
+        // it, a slow decoder (which a lower bitrate barely speeds up) delivers less. Once frames
+        // flow, the next hold starts afresh.
+        if held == Some(false) {
+            self.hold_cut = None;
+        }
+        let held = held == Some(true);
+        let helped = self
+            .hold_cut
+            .is_none_or(|(d, at)| now_us >= at + RATE_WINDOW_US && delivered * 10 >= d * 9);
+        let too_big = held && full_frames && helped;
         let old = self.target_bps;
-        if blocked || (queue_us > high && ours) {
+        if blocked || too_big || (queue_us > high && ours) {
             if now_us >= self.last_cut_us + CUT_EVERY_US {
                 self.last_cut_us = now_us;
                 self.slow_start = false;
                 let mut next = self.target_bps * 85 / 100;
                 // A delivered rate well under the target may just be light content; only a
                 // rate near the target says something about the path.
-                if delivered >= self.target_bps / 2 {
+                // So does one that holds frames back, once a whole second of it has been seen.
+                let measured = self
+                    .first_send_us
+                    .is_some_and(|t| now_us >= t + RATE_WINDOW_US);
+                if too_big && measured {
+                    self.hold_cut = Some((delivered, now_us));
+                }
+                if delivered >= self.target_bps / 2 || (too_big && measured) {
                     next = next.min(delivered * 85 / 100);
                     self.ceiling = Some((delivered, now_us + CEILING_US));
                 }
                 self.target_bps = next.max(self.min_bps);
             }
-        } else if queue_us < low && self.srtt_us > 0.0 && sent * 2 >= self.target_bps {
+        } else if queue_us < low && self.srtt_us > 0.0 && sent * 2 >= self.target_bps && !held {
             let t = self.target_bps;
             self.target_bps = match self.ceiling {
                 _ if self.slow_start => t * 3 / 2,
@@ -420,6 +481,73 @@ mod tests {
             "target {} should follow the path down",
             p.target_bps
         );
+    }
+
+    #[test]
+    fn heavy_content_on_a_slow_link_settles_at_the_link_rate() {
+        // Scrolling text into a 3 Mbit/s path: each frame is as big as the target allows, and the
+        // pacer holds frames back while the link is behind. The pacer alone keeps the queue
+        // short, so what it sends looks no bigger than what gets through; the target still has
+        // to come down to the link, or every frame is too big and most are skipped.
+        let mut p = Pacer::new(16_000_000, 250_000, 50_000_000, 60);
+        let (mut t, mut link_free, mut id) = (0u64, 0u64, 0u32);
+        let mut acks = VecDeque::new();
+        let mut sent_late = 0;
+        while t < 8_000_000 {
+            while acks.front().is_some_and(|(at, _)| *at <= t) {
+                let (at, i) = acks.pop_front().unwrap();
+                p.on_ack(i, at);
+            }
+            if p.can_send(t) {
+                let bytes = p.target_bps / 8 / 60;
+                p.on_send(id, bytes as usize, t);
+                // 375 bytes per ms, behind a 30 ms round trip.
+                link_free = link_free.max(t) + bytes * 1000 / 375;
+                acks.push_back((link_free + 30_000, id));
+                id += 1;
+                if t >= 6_000_000 {
+                    sent_late += 1;
+                }
+            }
+            t += 16_667;
+            p.adjust(t);
+        }
+        assert!(
+            p.target_bps < 3_500_000,
+            "target {} should come down to the link",
+            p.target_bps
+        );
+        assert!(sent_late >= 100, "{sent_late} frames in the last 2 s");
+    }
+
+    #[test]
+    fn a_slow_decoder_is_not_a_slow_link() {
+        // A fast link to a viewer that takes 25 ms to decode each frame, whatever its size: frames
+        // are held back, but a lower bitrate gets no more of them through, so after a first step
+        // down it must not keep falling.
+        let mut p = Pacer::new(16_000_000, 250_000, 50_000_000, 60);
+        let (mut t, mut decoder_free, mut id) = (0u64, 0u64, 0u32);
+        let mut acks = VecDeque::new();
+        let mut at_10s = 0;
+        while t < 30_000_000 {
+            if at_10s == 0 && t >= 10_000_000 {
+                at_10s = p.target_bps;
+            }
+            while acks.front().is_some_and(|(at, _)| *at <= t) {
+                let (at, i) = acks.pop_front().unwrap();
+                p.on_ack(i, at);
+            }
+            if p.can_send(t) {
+                p.on_send(id, (p.target_bps / 8 / 60) as usize, t);
+                decoder_free = decoder_free.max(t + 5_000) + 25_000;
+                acks.push_back((decoder_free, id));
+                id += 1;
+            }
+            t += 16_667;
+            p.adjust(t);
+        }
+        assert!(at_10s >= 4_000_000, "target fell to {at_10s}");
+        assert!(p.target_bps >= at_10s, "{} after {at_10s}", p.target_bps);
     }
 
     #[test]

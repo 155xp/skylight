@@ -23,7 +23,7 @@
 //     from a dropped socket to the first frame after the client reconnects on its own
 import { chromium } from 'playwright-core';
 import { homedir, hostname } from 'node:os';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { loadPrivateKey, mintTicket } from '../clients/node/mint-ticket.mjs';
 
 const arg = (name, def) => {
@@ -31,6 +31,17 @@ const arg = (name, def) => {
   return i > 0 ? process.argv[i + 1] : def;
 };
 const flag = (name) => process.argv.includes(`--${name}`);
+// Anything unknown (a typo, or --help) stops here: without this, the bench would run with its
+// defaults, against whatever server listens on the default port.
+const known = /^--(aud|base|chromium|connects|idle|jank|json|key|mbps|modes|motion|quality|samples|screenshot|seconds|server-pid|x-pid|headed|no-motion|no-smooth|no-worker)$/;
+const unknown = process.argv.slice(2).filter((a) => a.startsWith('-') && !known.test(a));
+if (unknown.length) {
+  const usage = readFileSync(new URL(import.meta.url), 'utf8').match(/^(\/\/.*\n)+/)[0].replace(/^\/\/ ?/gm, '');
+  const help = unknown.every((a) => a === '--help' || a === '-h');
+  console.log(usage);
+  if (!help) console.error(`unknown option: ${unknown.join(' ')}`);
+  process.exit(help ? 0 : 2);
+}
 const base = arg('base', 'http://127.0.0.1:5490/');
 const samples = Number(arg('samples', 30));
 const seconds = Number(arg('seconds', 10));

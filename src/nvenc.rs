@@ -373,6 +373,8 @@ pub struct NvEncoder {
     fps: u32,
     /// The cap is raised for this one frame (a keyframe) and restored after it.
     boosted: bool,
+    /// The first keyframe gets the raise too (`EncoderParams::first_key_boost`).
+    boost_first: bool,
 }
 
 unsafe impl Send for NvEncoder {}
@@ -403,6 +405,7 @@ impl NvEncoder {
             vbv_ms: p.vbv_ms.max(1),
             fps: p.fps.max(1),
             boosted: false,
+            boost_first: p.first_key_boost,
         };
         let mut open: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS = unsafe { std::mem::zeroed() };
         open.version = OPEN_SESSION_VER;
@@ -625,7 +628,7 @@ impl NvEncoder {
         self.check(unsafe { f.unlock_input_buffer.unwrap()(self.enc, self.input) })?;
         self.locked = None;
 
-        if opts.keyframe && !self.boosted {
+        if opts.keyframe && !self.boosted && (self.frame > 0 || self.boost_first) {
             // A forced keyframe repaints everything at once. Give that one frame four times the
             // usual budget, so it comes out sharp instead of smeared, then drop back on the next.
             let rate = (self.bitrate * 4).max(16_000_000);

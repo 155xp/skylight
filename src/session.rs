@@ -1216,7 +1216,10 @@ fn encoder_loop(
             .as_ref()
             .is_none_or(|e| e.width != w || e.height != h || e.codec != codec)
         {
-            let bitrate = sh.pacer.lock().unwrap().target_bps;
+            let (bitrate, link_known) = {
+                let p = sh.pacer.lock().unwrap();
+                (p.target_bps, p.min_rtt_us > 0)
+            };
             let params = EncoderParams {
                 codec,
                 width: w,
@@ -1228,6 +1231,11 @@ fn encoder_loop(
                 backend: cfg.encoder,
                 nvenc_preset: cfg.nvenc_preset,
                 cq: cfg.cq,
+                // Before the first frame is acknowledged nothing is known about the link (a
+                // remembered target may never have been put to the test): a keyframe sized for a
+                // fast one would keep a slow one waiting. It goes out at the usual budget instead,
+                // and the refinement frames after it bring it to full sharpness.
+                first_key_boost: link_known,
                 ..Default::default()
             };
             match open_encoder(&params, &skip) {

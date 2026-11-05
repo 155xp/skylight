@@ -71,6 +71,9 @@ pub struct EncoderParams {
     /// kilobytes: VBR with the average at the cap on NVENC (FFmpeg drops the VBV when NVENC's
     /// own constant-quality target is used, so `q` is not passed there), capped CRF `q` on x264.
     pub cq: Option<u8>,
+    /// Give the first keyframe a bigger budget too, like every forced keyframe after it (where
+    /// the encoder does that).
+    pub first_key_boost: bool,
 }
 
 impl Default for EncoderParams {
@@ -87,6 +90,7 @@ impl Default for EncoderParams {
             nvenc_preset: 2,
             x264_preset: "superfast".into(),
             cq: Some(23),
+            first_key_boost: true,
         }
     }
 }
@@ -411,7 +415,7 @@ impl VideoEncoder {
             (*ctx).max_b_frames = 0;
             (*ctx).flags |= ff::AV_CODEC_FLAG_LOW_DELAY as i32;
             enc.apply_rate(p.bitrate);
-            if name == "libx264" {
+            if name == "libx264" && p.first_key_boost {
                 // A viewer's first frame is a keyframe that repaints everything: open with four
                 // times the usual budget so it comes out sharp, and drop to normal after it.
                 (*ctx).bit_rate = (p.bitrate * 4) as i64;
@@ -1115,6 +1119,26 @@ mod tests {
             sizes.push(out.len());
         }
         assert!(sizes[2..].iter().all(|&b| b < normal_vbv * 2), "{sizes:?}");
+    }
+
+    #[test]
+    fn x264_first_keyframe_keeps_the_normal_budget_when_asked() {
+        let p = EncoderParams {
+            width: 640,
+            height: 360,
+            bitrate: 1_000_000,
+            cq: None,
+            vbv_ms: 34,
+            backend: Backend::Software,
+            first_key_boost: false,
+            ..Default::default()
+        };
+        let mut enc = VideoEncoder::open_named("libx264", &p).unwrap();
+        let normal_vbv = 1_000_000 / 8 * 34 / 1000;
+        let mut out = Vec::new();
+        noise(&mut enc, 1);
+        assert!(enc.encode(true, &mut out).unwrap());
+        assert!(out.len() < normal_vbv * 2, "keyframe {} B", out.len());
     }
 
     #[test]

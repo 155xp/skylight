@@ -1,4 +1,5 @@
-//! X11: MIT-SHM capture driven by XDamage, cursor shape from XFixes, input through XTEST.
+//! X11: MIT-SHM capture driven by XDamage, cursor shape from XFixes, input through XTEST, the
+//! clipboard through a window of our own (`x11clip`).
 //!
 //! Only damaged regions are read back. XDamage reports each changed rectangle in its event, the
 //! capture thread sleeps until such events arrive (pointer motion comes as XInput 2 events, so an
@@ -22,6 +23,7 @@ use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::protocol::{Event, damage, shm, xfixes, xinput, xtest};
 use x11rb::rust_connection::RustConnection;
 
+use super::x11clip::X11Clipboard;
 use super::{Backend, Capture, Clipboard, InputSink, MonitorInfo, TouchKind};
 use crate::clock;
 use crate::frame::{CursorPos, CursorShape, FrameStore, PixelFormat, Rect};
@@ -30,6 +32,7 @@ pub struct X11Backend {
     conn: Arc<RustConnection>,
     root: xproto::Window,
     input: Arc<X11Input>,
+    clipboard: Option<Arc<X11Clipboard>>,
     /// The X server is Xwayland inside a Wayland session: its root window is not the desktop.
     pub xwayland: bool,
 }
@@ -55,10 +58,15 @@ impl X11Backend {
             root,
             scroll: Mutex::new((0.0, 0.0)),
         });
+        let clipboard = X11Clipboard::open(None)
+            .inspect_err(|e| tracing::warn!("no X11 clipboard: {e:#}"))
+            .ok()
+            .map(Arc::new);
         Ok(X11Backend {
             conn,
             root,
             input,
+            clipboard,
             xwayland,
         })
     }
@@ -147,7 +155,7 @@ impl Backend for X11Backend {
     }
 
     fn clipboard(&self) -> Option<Arc<dyn Clipboard>> {
-        None
+        self.clipboard.clone().map(|c| c as Arc<dyn Clipboard>)
     }
 }
 

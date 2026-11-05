@@ -18,7 +18,7 @@ arrives. The cursor is drawn by the browser, so it never lags.
 - **Runs in any modern browser.** No plugin or app. Hardware decoding wherever the browser has it
   (WebCodecs, H.264 by default, HEVC and AV1 when both ends support them).
 - **KDE Plasma on Wayland** (KWin screencast, fake input, clipboard) and **X11** (MIT-SHM, XDamage,
-  XTEST).
+  XTEST, clipboard).
 - **NVENC driven directly**, or VAAPI or software encoding (x264, x265, SVT-AV1), with damage
   tracking: an idle screen sends nothing and costs nothing.
 - **Built for Mac and iPhone clients:** keys by physical position, Cmd mapped to Ctrl, clipboard
@@ -127,7 +127,7 @@ or from the matching flags (`skylight serve --help`):
 | | Capture | Input | Clipboard |
 |---|---|---|---|
 | `kde` (KWin, Wayland) | `zkde_screencast_unstable_v1` → PipeWire memfd, damage and cursor metadata | `org_kde_kwin_fake_input` | `wlr-data-control` |
-| `x11` | XDamage, then MIT-SHM (or plain GetImage where shared memory is unavailable); cursor from XFixes | XTEST | not yet |
+| `x11` | XDamage, then MIT-SHM (or plain GetImage where shared memory is unavailable); cursor from XFixes | XTEST | CLIPBOARD text, changes noticed through XFixes |
 | `synthetic` | moving test pattern | none | none (used by `bench` and tests) |
 
 `auto` picks KWin when a Wayland socket is there and KWin's protocols are offered, then X11. A

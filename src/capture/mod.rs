@@ -11,6 +11,7 @@ pub mod kde;
 pub mod pw;
 pub mod synthetic;
 pub mod x11;
+pub mod x11clip;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};

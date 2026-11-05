@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use ffmpeg_sys_next as ff;
 use serde::{Deserialize, Serialize};
 
-use crate::frame::PixelFormat;
+use crate::frame::{PixelFormat, Rect};
 use crate::nvenc::{FrameOpts, NvEncoder};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
@@ -164,6 +164,13 @@ pub struct VideoEncoder {
     /// Converted frame for encoders that need YUV in system memory (x264) or a GPU upload (VAAPI).
     conv: *mut ff::AVFrame,
     sws: *mut ff::SwsContext,
+    /// Converts one band of `BAND` rows, for frames where only a few bands changed (even sizes
+    /// only; null otherwise).
+    band_sws: *mut ff::SwsContext,
+    /// Bands of `conv` that are behind `src`: everything at first, then what `changed` reports.
+    stale: Vec<bool>,
+    /// The caller took `input()` without saying what it changed: convert the whole frame.
+    whole: bool,
     hw_device: *mut ff::AVBufferRef,
     pkt: *mut ff::AVPacket,
     pts: i64,
@@ -179,6 +186,9 @@ pub struct VideoEncoder {
 
 // The raw pointers are owned exclusively by this struct and only touched from one thread at a time.
 unsafe impl Send for VideoEncoder {}
+
+/// Rows per band in the partial colour conversion (even, for 4:2:0 chroma).
+const BAND: u32 = 16;
 
 fn averr(code: i32) -> String {
     let mut buf = [0 as libc::c_char; 128];
@@ -324,6 +334,9 @@ impl VideoEncoder {
                 src: ptr::null_mut(),
                 conv: ptr::null_mut(),
                 sws: ptr::null_mut(),
+                band_sws: ptr::null_mut(),
+                stale: Vec::new(),
+                whole: true,
                 hw_device: ptr::null_mut(),
                 pkt: ptr::null_mut(),
                 pts: 0,
@@ -359,6 +372,9 @@ impl VideoEncoder {
             src: ptr::null_mut(),
             conv: ptr::null_mut(),
             sws: ptr::null_mut(),
+            band_sws: ptr::null_mut(),
+            stale: Vec::new(),
+            whole: true,
             hw_device: ptr::null_mut(),
             pkt: ptr::null_mut(),
             pts: 0,
@@ -532,6 +548,23 @@ impl VideoEncoder {
                 }
                 let threads = CString::new("threads").unwrap();
                 ff::av_opt_set_int(enc.sws as *mut _, threads.as_ptr(), 0, 0);
+                // Point sampling at the same size works row by row (chroma pairs of rows), so
+                // converting a band on its own gives the same bytes as converting the frame.
+                if p.width == ew && p.height == eh && eh >= BAND {
+                    enc.band_sws = ff::sws_getContext(
+                        ew as i32,
+                        BAND as i32,
+                        src_fmt,
+                        ew as i32,
+                        BAND as i32,
+                        dst_fmt,
+                        ff::SWS_POINT,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        ptr::null(),
+                    );
+                    enc.stale = vec![true; eh.div_ceil(BAND) as usize];
+                }
             }
             enc.pkt = ff::av_packet_alloc();
         }
@@ -580,6 +613,7 @@ impl VideoEncoder {
         if let Some(nv) = &mut self.nv {
             return nv.input();
         }
+        self.whole = true;
         unsafe {
             ff::av_frame_make_writable(self.src);
             let stride = (*self.src).linesize[0] as usize;
@@ -588,6 +622,74 @@ impl VideoEncoder {
                 std::slice::from_raw_parts_mut((*self.src).data[0], len),
                 stride,
             ))
+        }
+    }
+
+    /// Narrow what the last `input()` changed to `rects`, so encoders that convert the picture
+    /// first (software, VA-API) convert only the rows around them. Nothing changed is `&[]`.
+    pub fn changed(&mut self, rects: &[Rect]) {
+        if self.band_sws.is_null() {
+            return;
+        }
+        self.whole = false;
+        for r in rects {
+            if r.w == 0 || r.h == 0 {
+                continue;
+            }
+            let last = ((r.y + r.h - 1) / BAND) as usize;
+            for b in (r.y / BAND) as usize..=last.min(self.stale.len() - 1) {
+                self.stale[b] = true;
+            }
+        }
+    }
+
+    /// Bring `conv` up to date with `src`: the whole frame, or only the stale bands when they
+    /// are few (banding the whole frame is slower than one pass).
+    unsafe fn convert(&mut self) {
+        unsafe {
+            let bands = self.stale.iter().filter(|s| **s).count();
+            if self.whole || self.band_sws.is_null() || bands * 10 > self.stale.len() * 7 {
+                ff::sws_scale(
+                    self.sws,
+                    (*self.src).data.as_ptr() as *const *const u8,
+                    (*self.src).linesize.as_ptr(),
+                    0,
+                    self.height as i32,
+                    (*self.conv).data.as_ptr(),
+                    (*self.conv).linesize.as_ptr(),
+                );
+            } else {
+                let (s, d) = (&*self.src, &*self.conv);
+                for (b, _) in self.stale.iter().enumerate().filter(|(_, s)| **s) {
+                    // The last band overlaps the one before when the height is not a multiple
+                    // of BAND; converting rows twice gives the same bytes.
+                    let y = (b as u32 * BAND).min(self.height - BAND) as usize;
+                    // swscale reads four plane pointers from each array.
+                    let sp = [
+                        s.data[0].add(y * s.linesize[0] as usize) as *const u8,
+                        ptr::null(),
+                        ptr::null(),
+                        ptr::null(),
+                    ];
+                    let dp = [
+                        d.data[0].add(y * d.linesize[0] as usize),
+                        d.data[1].add(y / 2 * d.linesize[1] as usize),
+                        d.data[2].add(y / 2 * d.linesize[2] as usize),
+                        ptr::null_mut(),
+                    ];
+                    ff::sws_scale(
+                        self.band_sws,
+                        sp.as_ptr(),
+                        s.linesize.as_ptr(),
+                        0,
+                        BAND as i32,
+                        dp.as_ptr(),
+                        d.linesize.as_ptr(),
+                    );
+                }
+            }
+            self.stale.fill(false);
+            self.whole = false;
         }
     }
 
@@ -633,15 +735,7 @@ impl VideoEncoder {
                 self.src
             } else {
                 ff::av_frame_make_writable(self.conv);
-                ff::sws_scale(
-                    self.sws,
-                    (*self.src).data.as_ptr() as *const *const u8,
-                    (*self.src).linesize.as_ptr(),
-                    0,
-                    self.height as i32,
-                    (*self.conv).data.as_ptr(),
-                    (*self.conv).linesize.as_ptr(),
-                );
+                self.convert();
                 if self.hw_device.is_null() {
                     self.conv
                 } else {
@@ -755,8 +849,10 @@ impl Drop for VideoEncoder {
                     ff::av_frame_free(f);
                 }
             }
-            if !self.sws.is_null() {
-                ff::sws_freeContext(self.sws);
+            for c in [self.sws, self.band_sws] {
+                if !c.is_null() {
+                    ff::sws_freeContext(c);
+                }
             }
             if !self.pkt.is_null() {
                 ff::av_packet_free(&mut self.pkt);
@@ -931,6 +1027,43 @@ mod tests {
         gradient(&mut enc, 0);
         let mut out = Vec::new();
         assert!(enc.encode(true, &mut out).unwrap());
+    }
+
+    #[test]
+    fn converting_only_changed_bands_matches_converting_everything() {
+        // 40 rows: the last band overlaps the one before it.
+        let mut enc = software(64, 40, 2_000_000, None);
+        let planes = |enc: &VideoEncoder| unsafe {
+            (0..3)
+                .map(|p| {
+                    let rows = if p == 0 { 40 } else { 20 };
+                    let n = (*enc.conv).linesize[p] as usize * rows;
+                    std::slice::from_raw_parts((*enc.conv).data[p], n).to_vec()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut out = Vec::new();
+        noise(&mut enc, 1);
+        enc.encode(true, &mut out).unwrap();
+        for (seed, r) in [
+            (2u8, Rect::new(3, 5, 10, 4)),
+            (3, Rect::new(40, 30, 20, 10)),
+        ] {
+            let (buf, stride) = enc.input().unwrap();
+            for y in r.y as usize..(r.y + r.h) as usize {
+                for x in r.x as usize..(r.x + r.w) as usize {
+                    let v = (x * 7 + y * 13) as u8 ^ seed.wrapping_mul(77);
+                    buf[y * stride + x * 4..][..4].copy_from_slice(&[v, v / 2, 255 - v, 255]);
+                }
+            }
+            enc.changed(&[r]);
+            out.clear();
+            enc.encode(false, &mut out).unwrap();
+            let banded = planes(&enc);
+            enc.whole = true;
+            unsafe { enc.convert() };
+            assert_eq!(banded, planes(&enc), "change at {r:?}");
+        }
     }
 
     #[test]

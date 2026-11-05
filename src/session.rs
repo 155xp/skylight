@@ -1268,6 +1268,7 @@ fn encoder_loop(
             timeout = Duration::from_millis(1);
             continue;
         }
+        e.changed(&r.damage);
         last_seq = r.seq;
         last_gen = r.generation;
         // A refinement re-encodes the unchanged image. Under the constant-quality target that

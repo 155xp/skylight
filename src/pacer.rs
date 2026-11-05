@@ -297,14 +297,18 @@ impl Pacer {
                 let mut next = self.target_bps * 85 / 100;
                 // A delivered rate well under the target may just be light content; only a
                 // rate near the target says something about the path.
-                // So does one that holds frames back, once a whole second of it has been seen.
-                let measured = self
-                    .first_send_us
-                    .is_some_and(|t| now_us >= t + RATE_WINDOW_US);
-                if too_big && measured {
+                // So does one that holds frames back, once a whole second of it has been seen
+                // and while it keeps up with what is sent: a stall (or one huge frame ahead in
+                // the queue) delivers next to nothing for a while, which is not the link's rate.
+                let link_rate = too_big
+                    && delivered * 2 >= sent
+                    && self
+                        .first_send_us
+                        .is_some_and(|t| now_us >= t + RATE_WINDOW_US);
+                if link_rate {
                     self.hold_cut = Some((delivered, now_us));
                 }
-                if delivered >= self.target_bps / 2 || (too_big && measured) {
+                if delivered >= self.target_bps / 2 || link_rate {
                     next = next.min(delivered * 85 / 100);
                     self.ceiling = Some((delivered, now_us + CEILING_US));
                 }
@@ -518,6 +522,43 @@ mod tests {
             p.target_bps
         );
         assert!(sent_late >= 100, "{sent_late} frames in the last 2 s");
+    }
+
+    #[test]
+    fn big_frames_ahead_on_a_slow_link_are_not_taken_for_its_rate() {
+        // A still screen sharpens: three big refinement frames fill a 3 Mbit/s path for 1.6 s.
+        // Then scrolling starts, its frames held back behind them, and next to nothing is
+        // acknowledged for over a second. That is not the link's rate: the target must not drop
+        // to the floor, and must find the link afterwards.
+        let mut p = Pacer::new(16_000_000, 250_000, 50_000_000, 60);
+        let (mut t, mut link_free, mut id) = (0u64, 0u64, 0u32);
+        let mut acks = VecDeque::new();
+        let mut lowest = u64::MAX;
+        while t < 12_000_000 {
+            while acks.front().is_some_and(|(at, _)| *at <= t) {
+                let (at, i) = acks.pop_front().unwrap();
+                p.on_ack(i, at);
+            }
+            let frames = if t == 16_667 * 60 {
+                vec![200_000; 3]
+            } else if t > 16_667 * 66 && p.can_send(t) {
+                vec![p.target_bps / 8 / 60]
+            } else {
+                vec![]
+            };
+            for bytes in frames {
+                p.on_send(id, bytes as usize, t);
+                // 375 bytes per ms, behind a 30 ms round trip.
+                link_free = link_free.max(t) + bytes * 1000 / 375;
+                acks.push_back((link_free + 30_000, id));
+                id += 1;
+            }
+            t += 16_667;
+            p.adjust(t);
+            lowest = lowest.min(p.target_bps);
+        }
+        assert!(lowest > 1_000_000, "target fell to {lowest}");
+        assert!(p.target_bps > 2_000_000, "target {}", p.target_bps);
     }
 
     #[test]

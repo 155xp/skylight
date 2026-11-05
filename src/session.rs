@@ -788,6 +788,16 @@ async fn start_probe(
 const REFINE_AFTER: Duration = Duration::from_millis(120);
 /// ...and at least this long after the last input event (µs).
 const REFINE_QUIET_US: u64 = 300_000;
+/// The longest gap that spacing frames by their cost may make (10 frames a second).
+const MAX_FRAME_US: u64 = 100_000;
+
+/// Time between frames of motion. Frames that take longer than `base_us` at the target bitrate
+/// (scrolling text through 1 Mbit/s, where the encoder cannot make them small enough) go as
+/// often as the bitrate carries them, evenly, rather than in bursts the pacer has to hold back.
+fn frame_spacing_us(base_us: u64, frame_bits: f64, target_bps: u64) -> u64 {
+    let cost_us = (frame_bits * 1e6 / target_bps.max(1) as f64) as u64;
+    base_us.max(cost_us.min(MAX_FRAME_US))
+}
 
 /// How much each refinement frame lowers the QP on this encoder (see [`encode::Caps::refine`]),
 /// one entry per refinement frame. `SKYLIGHT_SHARPEN` (comma-separated) overrides it, for
@@ -926,6 +936,9 @@ fn encoder_loop(
     // Capture time (server clock) of the last frame of new content that went out.
     let mut last_capture_us = 0u64;
     let mut refine_left = 0u8;
+    // What a frame of motion costs, in bits (a moving average; keyframes and refinements, big
+    // on purpose, left out).
+    let mut frame_bits = 0f64;
     let mut cursor_serial = u32::MAX;
     let mut cursor_pos = None;
     let mut stats = Stats::new();
@@ -1141,7 +1154,7 @@ fn encoder_loop(
         }
         // Far away (a tunnel, the internet), frames arrive with the path's jitter: past
         // `remote_max_fps` more of them only make the motion less even and cost bytes.
-        let (path_fps, remote) = {
+        let (base_us, frame_us, remote) = {
             let mut p = sh.pacer.lock().unwrap();
             let remote = p.min_rtt_us > REMOTE_RTT_US;
             let f = if cfg.remote_max_fps > 0 && remote {
@@ -1149,10 +1162,10 @@ fn encoder_loop(
             } else {
                 fps
             };
-            p.frame_interval_us = 1_000_000 / f.max(1) as u64;
-            (f, remote)
+            let base_us = 1_000_000 / f.max(1) as u64;
+            p.frame_interval_us = frame_spacing_us(base_us, frame_bits, p.target_bps);
+            (base_us, p.frame_interval_us, remote)
         };
-        let frame_us = 1_000_000 / path_fps.max(1) as u64;
         let since_input = |t: &AtomicU64| now_us.saturating_sub(t.load(Ordering::Relaxed));
         let times = &*ctx.input_times;
         let answering = if remote {
@@ -1165,7 +1178,7 @@ fn encoder_loop(
         // most every half frame: after a click while the mouse keeps moving, every compositor frame
         // (144 a second on a fast monitor) would otherwise go out, unevenly.
         let interval = if answering && (new_content || pending) {
-            Duration::from_micros(if remote { frame_us / 2 } else { 0 })
+            Duration::from_micros(if remote { base_us / 2 } else { 0 })
         } else {
             Duration::from_micros(frame_us)
         };
@@ -1357,6 +1370,9 @@ fn encoder_loop(
             .lock()
             .unwrap()
             .on_send(frame_id, msg.len(), clock::now_us());
+        if !key && !refine {
+            frame_bits += (msg.len() as f64 * 8.0 - frame_bits) / 8.0;
+        }
         stats.frames += 1;
         stats.bytes += msg.len() as u64;
         stats.encode_us += encode_us;
@@ -1461,6 +1477,15 @@ fn send_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frames_too_big_for_the_bitrate_are_spaced_out() {
+        // 60 fps; 4 kB frames at 16 Mbit/s fit, the same frames at 1 Mbit/s take 32 ms each.
+        assert_eq!(frame_spacing_us(16_667, 32_000.0, 16_000_000), 16_667);
+        assert_eq!(frame_spacing_us(16_667, 32_000.0, 1_000_000), 32_000);
+        assert_eq!(frame_spacing_us(16_667, 1e6, 1_000_000), MAX_FRAME_US);
+        assert_eq!(frame_spacing_us(16_667, 0.0, 1_000_000), 16_667);
+    }
 
     #[test]
     fn a_drag_is_one_run_of_motion_and_a_click_always_counts() {

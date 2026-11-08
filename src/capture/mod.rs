@@ -75,6 +75,8 @@ pub const CLIPBOARD_MAX: usize = 1 << 20;
 
 /// Text clipboard of the remote desktop.
 pub trait Clipboard: Send + Sync {
+    /// Put `text` on the clipboard. Input injected after this returns pastes it (see
+    /// [`crate::input::InputCtx::paste`]).
     fn set_text(&self, text: String);
     /// The latest clipboard text, updated whenever something on the desktop copies text.
     fn watch(&self) -> tokio::sync::watch::Receiver<Option<Arc<str>>>;

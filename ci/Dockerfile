@@ -4,7 +4,7 @@ FROM rust:1-trixie
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       libpipewire-0.3-dev libspa-0.2-dev libavcodec-dev libavutil-dev libswscale-dev \
-      clang pkg-config nodejs \
+      clang pkg-config nodejs xvfb \
  && rm -rf /var/lib/apt/lists/* \
  && rustup component add rustfmt clippy
 WORKDIR /src

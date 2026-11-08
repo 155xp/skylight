@@ -10,6 +10,6 @@ jobs:
       - run: |
           apt-get update
           apt-get install -y --no-install-recommends libpipewire-0.3-dev libspa-0.2-dev \
-            libavcodec-dev libavutil-dev libswscale-dev clang pkg-config nodejs
+            libavcodec-dev libavutil-dev libswscale-dev clang pkg-config nodejs xvfb
           rustup component add rustfmt clippy
       - run: scripts/ci.sh

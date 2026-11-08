@@ -495,6 +495,8 @@ impl Clipboard for KdeClipboard {
             c.source = Some(source.clone());
             c.watch_tx.send_replace(Some(text));
         }
+        // Input goes through this same connection, which KWin reads in order: a paste injected
+        // after this sees the new selection.
         self.device.set_selection(Some(&source));
         let _ = self.conn.flush();
     }

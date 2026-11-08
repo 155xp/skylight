@@ -12,6 +12,14 @@ fi
 cargo fmt --check
 cargo clippy --release --locked --all-targets -- -D warnings
 cargo build --release --locked
+# The X11 clipboard test needs an X server of its own (it overwrites the clipboard).
+if [ -z "${SKYLIGHT_TEST_DISPLAY:-}" ] && command -v Xvfb >/dev/null; then
+  Xvfb :93 -nolisten tcp >/dev/null 2>&1 &
+  xvfb=$!
+  trap 'kill $xvfb' EXIT
+  sleep 1
+  export SKYLIGHT_TEST_DISPLAY=:93
+fi
 cargo test --release --locked
 node --test clients/node/test/
 node --check web/skylight.js

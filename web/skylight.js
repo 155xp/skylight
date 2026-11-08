@@ -18,16 +18,11 @@ const MSG_VIDEO = 1;
 const MSG_CURSOR_SHAPE = 2;
 const MSG_CURSOR_POS = 3;
 const IN_POINTER_ABS = 0x10;
-const IN_POINTER_REL = 0x11;
 const IN_BUTTON = 0x12;
 const IN_SCROLL = 0x13;
 const IN_KEY = 0x14;
 const IN_TOUCH = 0x15;
-const IN_ACK = 0x16;
 const IN_TEXT = 0x17;
-const FLAG_KEY = 1;
-const FLAG_REFINE = 2;
-const CODECS = { 1: 'h264', 2: 'hevc', 3: 'av1' };
 
 // KeyboardEvent.code to Linux evdev keycodes.
 const KEYMAP = {
@@ -55,6 +50,8 @@ const KEY_RIGHTCTRL = 97;
 const KEY_BACKSPACE = 14;
 const KEY_ENTER = 28;
 const MODIFIERS = new Set([29, 97, 42, 54, 56, 100, 125, 126]);
+// PointerEvent.button (0 left, 1 middle, 2 right, 3 back, 4 forward) to its bit in `buttons`.
+const BUTTON_BITS = [1, 4, 2, 8, 16];
 
 const isApple = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent);
 
@@ -502,6 +499,7 @@ export const avcConfig = core.avcConfig;
 function videoWorker(core) {
   let canvas = null;
   let ws = null;
+  let wsId = 0;
   let sink = null;
   let watch = false;
   let software = false;
@@ -512,10 +510,13 @@ function videoWorker(core) {
       canvas = m.canvas;
     } else if (m.t === 'open') {
       const id = m.id;
+      // One socket at a time: a new one means the page gave up on the last.
+      if (ws) ws.close();
       const sock = new WebSocket(m.url);
       sock.binaryType = 'arraybuffer';
       if (sink) sink.close();
       ws = sock;
+      wsId = id;
       sink = new core.VideoSink(canvas, {
         send: (d) => sock.readyState === 1 && sock.send(d),
         event: (ev, transfer) => self.postMessage({ ...ev, id }, transfer || []),
@@ -545,9 +546,9 @@ function videoWorker(core) {
         self.postMessage({ t: 'close', id });
       };
     } else if (m.t === 'send') {
-      if (ws && ws.readyState === 1) ws.send(m.data);
+      if (ws && ws.readyState === 1 && m.id === wsId) ws.send(m.data);
     } else if (m.t === 'close') {
-      if (ws) ws.close();
+      if (ws && m.id === wsId) ws.close();
     } else if (m.t === 'watch') {
       watch = m.on;
       if (sink) sink.watch = m.on;
@@ -583,13 +584,13 @@ class WorkerSocket {
   }
 
   send(data) {
-    if (this.readyState === 1) this.worker.postMessage({ t: 'send', data });
+    if (this.readyState === 1) this.worker.postMessage({ t: 'send', id: this.id, data });
   }
 
   close() {
     if (this.readyState < 2) {
       this.readyState = 2;
-      this.worker.postMessage({ t: 'close' });
+      this.worker.postMessage({ t: 'close', id: this.id });
     }
   }
 }
@@ -633,7 +634,11 @@ export class Skylight extends EventTarget {
     this.width = 0;
     this.height = 0;
     this.cursor = { x: 0, y: 0, visible: true, url: null, hotX: 0, hotY: 0, w: 0, h: 0, rgba: null };
-    this.pressedKeys = new Set();
+    /**
+     * Everything pressed on the remote desktop, as _sendInput sent it, keyed by what lets it go:
+     * `k<keycode>`, `b<button>`, and `t<id>` for a touch (with where it is, for its cancel).
+     */
+    this._held = new Map();
     this.clock = { offset: 0, bestRtt: Infinity, samples: [] };
     /** Everything that arrived on the main socket, for idle-cost checks. */
     this.received = { messages: 0, bytes: 0 };
@@ -642,6 +647,8 @@ export class Skylight extends EventTarget {
     this.vcursor = { x: 0, y: 0 };
     this.bench = null;
     this.retry = 0;
+    this._gen = 0;
+    this._attempt = null;
     this._healthIssue = null;
     this._build();
     this._bindInput();
@@ -650,9 +657,15 @@ export class Skylight extends EventTarget {
 
   // ---------------------------------------------------------------- public API
 
+  /**
+   * Connect, replacing any session or attempt there was. Each call, and each disconnect(), starts
+   * a new generation; an older attempt stops at its next step (after the video setup, the ticket
+   * callback or any socket event), so one that was cancelled can never come back as a session.
+   */
   async connect() {
-    this._closing = false;
+    const gen = this._cancel();
     await this._videoReady;
+    if (gen !== this._gen) return;
     const urls = Array.isArray(this.opts.url) ? this.opts.url : [this.opts.url];
     this._setState('connecting');
     let lastErr = null;
@@ -664,9 +677,11 @@ export class Skylight extends EventTarget {
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           if (!ticket) ticket = typeof this.opts.ticket === 'function' ? await this.opts.ticket() : this.opts.ticket;
-          await this._open(url, ticket);
+          if (gen !== this._gen) return;
+          await this._open(url, ticket, gen);
           return;
         } catch (e) {
+          if (gen !== this._gen) return;
           lastErr = e;
           if (e.ticketSpent) ticket = null;
           if (e.ticketSpent && typeof this.opts.ticket !== 'function') break;
@@ -679,10 +694,7 @@ export class Skylight extends EventTarget {
   }
 
   disconnect() {
-    this._closing = true;
-    clearTimeout(this._reconnectTimer);
-    if (this.ws) this.ws.close();
-    this._teardown();
+    this._cancel();
     this._setState('disconnected', 'closed');
   }
 
@@ -1078,21 +1090,25 @@ export class Skylight extends EventTarget {
     }
   }
 
-  _open(url, ticket) {
+  _open(url, ticket, gen) {
     return new Promise((resolve, reject) => {
       const ws = this.worker ? (this._wsock = new WorkerSocket(this.worker, url, ++this._sockets)) : new WebSocket(url);
       ws.binaryType = 'arraybuffer';
       let settled = false;
       let opened = false;
       const fail = (msg, extra) => Object.assign(new Error(msg), { beforeOpen: !opened, ticketSpent: opened }, extra);
-      const timer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          ws.close();
-          reject(fail(`timed out connecting to ${url}`));
-        }
-      }, 6000);
+      const giveUp = (msg) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        ws.close();
+        reject(fail(msg));
+      };
+      const timer = setTimeout(() => giveUp(`timed out connecting to ${url}`), 6000);
+      // For _cancel: the socket is closed now, not once its handshake ends.
+      this._attempt = () => giveUp('cancelled');
       ws.onopen = () => {
+        if (gen !== this._gen) return giveUp('cancelled');
         opened = true;
         this._url = url;
         ws.send(JSON.stringify({
@@ -1106,6 +1122,8 @@ export class Skylight extends EventTarget {
         }));
       };
       ws.onmessage = (ev) => {
+        // Nothing from an attempt given up on, or from a session since replaced.
+        if (gen !== this._gen || (settled && this.ws !== ws)) return giveUp('cancelled');
         this._heard = performance.now();
         this.received.messages++;
         this.received.bytes += typeof ev.data === 'string' ? ev.data.length : ev.data.byteLength;
@@ -1140,10 +1158,8 @@ export class Skylight extends EventTarget {
         if (this.ws === ws) {
           this.ws = null;
           this._teardown();
-          if (!this._closing) {
-            this._setState('disconnected', this._lastError || 'connection lost');
-            this._scheduleReconnect();
-          }
+          this._setState('disconnected', this._lastError || 'connection lost');
+          this._scheduleReconnect();
         }
       };
     });
@@ -1160,6 +1176,14 @@ export class Skylight extends EventTarget {
    * reconnect now; TCP can take many minutes to give up, and through a proxy it never notices.
    */
   _abandon() {
+    if (!this.ws) return;
+    this._drop();
+    this._setState('disconnected', 'the connection went silent');
+    this._scheduleReconnect();
+  }
+
+  /** Close the session without a word to the page (its socket's onclose is detached first). */
+  _drop() {
     const ws = this.ws;
     if (!ws) return;
     ws.onclose = null;
@@ -1167,14 +1191,21 @@ export class Skylight extends EventTarget {
     ws.close();
     this.ws = null;
     this._teardown();
-    if (!this._closing) {
-      this._setState('disconnected', 'the connection went silent');
-      this._scheduleReconnect();
-    }
+  }
+
+  /** Start a new generation (see connect()): the session and any attempt under way end here. */
+  _cancel() {
+    const gen = ++this._gen;
+    clearTimeout(this._reconnectTimer);
+    const attempt = this._attempt;
+    this._attempt = null;
+    if (attempt) attempt();
+    this._drop();
+    return gen;
   }
 
   _scheduleReconnect() {
-    if (!this.opts.reconnect || this._closing || typeof this.opts.ticket !== 'function') return;
+    if (!this.opts.reconnect || typeof this.opts.ticket !== 'function') return;
     const delay = [0, 500, 1000, 2000, 5000, 10000][Math.min(this.retry++, 5)];
     clearTimeout(this._reconnectTimer);
     this._reconnectTimer = setTimeout(() => this.connect(), delay);
@@ -1210,7 +1241,8 @@ export class Skylight extends EventTarget {
     this._setState('connected', m);
     this.dispatchEvent(new CustomEvent('monitors', { detail: { monitors: m.monitors, current: m.monitor } }));
     this._lastPointer = null;
-    this._held = new Set();
+    // A new session starts with nothing pressed (the server lets go of all when one ends).
+    this._held.clear();
     this._lastDiscrete = 0;
     this._inputTries = 0;
     if (m.inputToken) this._openInput(m.inputToken);
@@ -1238,14 +1270,18 @@ export class Skylight extends EventTarget {
    */
   _openInput(token) {
     const main = this.ws;
-    const url = this._url.replace(/\/ws(\?.*)?$/, '/input');
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(this._inputUrl());
     ws.binaryType = 'arraybuffer';
+    // Known from the start, so that _teardown closes it while it is still connecting.
+    this._inputReady = ws;
     let opened = 0;
     ws.onopen = () => {
+      if (this.ws !== main || this._inputReady !== ws) {
+        ws.close();
+        return;
+      }
       opened = performance.now();
       ws.send(JSON.stringify({ token }));
-      this._inputReady = ws;
       this._maybeSwitchInput();
     };
     ws.onclose = () => {
@@ -1258,6 +1294,15 @@ export class Skylight extends EventTarget {
       clearTimeout(this._inputRetry);
       this._inputRetry = setTimeout(() => this.ws === main && this._send({ t: 'input-token' }), delay);
     };
+  }
+
+  /** `input` in the main socket's directory (`/ws` or `/desk/ws/` gives `/desk/input`), same query. */
+  _inputUrl() {
+    const u = new URL(this._url, location.href);
+    if (u.protocol === 'http:' || u.protocol === 'https:') u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+    u.hash = '';
+    u.pathname = u.pathname.replace(/\/+$/, '').replace(/[^/]*$/, 'input');
+    return u.href;
   }
 
   /** Move input to its own socket when doing so cannot reorder a press and its release. */
@@ -1278,15 +1323,14 @@ export class Skylight extends EventTarget {
     const b = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
     if (b[0] === IN_BUTTON || b[0] === IN_KEY || b[0] === IN_TEXT || b[0] === IN_TOUCH) {
       this._lastDiscrete = performance.now();
-      // What is pressed: buttons, keys, and touches between down (0) and up or cancel (2, 3).
-      const held =
-        b[0] === IN_BUTTON ? [`b${b[1]}`, b[2] === 1]
-        : b[0] === IN_KEY ? [`k${b[2] | (b[3] << 8)}`, b[1] === 1]
-        : b[0] === IN_TOUCH && b[1] !== 1 ? [`t${b[2]}`, b[1] === 0]
-        : null;
-      if (held && this._held) {
-        if (held[1]) this._held.add(held[0]);
-        else this._held.delete(held[0]);
+      if (b[0] === IN_BUTTON) this._hold(`b${b[1]}`, b[2] === 1);
+      else if (b[0] === IN_KEY) this._hold(`k${b[2] | (b[3] << 8)}`, b[1] === 1);
+      else if (b[0] === IN_TOUCH) {
+        // Down (0) to up or cancel (2, 3); a move (1) only updates where it is.
+        const t = `t${b[2]}`;
+        const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+        if (b[1] === 0 || (b[1] === 1 && this._held.has(t))) this._held.set(t, [dv.getFloat32(4, true), dv.getFloat32(8, true)]);
+        else if (b[1] !== 1) this._held.delete(t);
       }
     }
     const ws = this.inputWs && this.inputWs.readyState === 1 ? this.inputWs : this.ws;
@@ -1371,7 +1415,8 @@ export class Skylight extends EventTarget {
     const s = this._wsock;
     const mine = s && m.id === s.id;
     if (m.t === 'open') {
-      if (mine) {
+      // Not one closed meanwhile: its open was already on the way.
+      if (mine && s.readyState === 0) {
         s.readyState = 1;
         if (s.onopen) s.onopen();
       }
@@ -1630,8 +1675,6 @@ export class Skylight extends EventTarget {
   }
 
   _key(code, down) {
-    if (down) this.pressedKeys.add(code);
-    else this.pressedKeys.delete(code);
     this._sendInput(new Uint8Array([IN_KEY, down ? 1 : 0, code & 0xff, code >> 8]));
   }
 
@@ -1646,11 +1689,22 @@ export class Skylight extends EventTarget {
     this._sendInput(m);
   }
 
+  _hold(what, down) {
+    if (down) this._held.set(what, true);
+    else this._held.delete(what);
+  }
+
+  _keyHeld(code) {
+    return this._held.has(`k${code}`);
+  }
+
+  /** Let go of everything still held, newest first: keys and buttons go up, touches are cancelled. */
   _releaseAll() {
-    for (const k of [...this.pressedKeys]) this._key(k, false);
-    if (this._buttonsDown) {
-      for (const b of this._buttonsDown) this._button(b, false);
-      this._buttonsDown.clear();
+    for (const [what, at] of [...this._held].reverse()) {
+      const n = Number(what.slice(1));
+      if (what[0] === 'k') this._key(n, false);
+      else if (what[0] === 'b') this._button(n, false);
+      else this._touch(3, n, at[0], at[1]);
     }
   }
 
@@ -1665,9 +1719,7 @@ export class Skylight extends EventTarget {
   }
 
   _bindInput() {
-    const c = this.canvas;
     const root = this.root;
-    this._buttonsDown = new Set();
     const moveEvent = 'onpointerrawupdate' in window ? 'pointerrawupdate' : 'pointermove';
 
     root.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -1685,15 +1737,31 @@ export class Skylight extends EventTarget {
       }
       const p = this._toStream(e.clientX, e.clientY);
       this._pointer(p.x, p.y);
-      if (e.button >= 0 && e.button <= 4) {
-        this._buttonsDown.add(e.button);
-        this._button(e.button, true);
-      }
+      if (e.button >= 0 && e.button <= 4) this._button(e.button, true);
     });
+    // Buttons the mouse or pen no longer holds go up. A second button pressed or let go during a
+    // drag (a chord) comes as a pointermove; only the last one up is a pointerup.
+    const settle = (e) => {
+      for (let b = 0; b <= 4; b++) if (this._held.has(`b${b}`) && !(e.buttons & BUTTON_BITS[b])) this._button(b, false);
+    };
     root.addEventListener('pointerup', (e) => {
       if (e.pointerType === 'touch' || !this._canInput()) return;
-      if (this._buttonsDown.delete(e.button)) this._button(e.button, false);
+      settle(e);
     });
+    root.addEventListener('pointermove', (e) => {
+      if (e.pointerType === 'touch' || e.button < 0 || e.button > 4 || !this._canInput()) return;
+      if (e.buttons & BUTTON_BITS[e.button]) {
+        if (!this._held.has(`b${e.button}`)) this._button(e.button, true);
+      } else settle(e);
+    });
+    // A drag the browser cancels (a pen handed to a gesture, capture taken away) never sees its
+    // pointerup: let go of everything it held.
+    const cancel = (e) => {
+      if (e.pointerType === 'touch') return;
+      for (let b = 0; b <= 4; b++) if (this._held.has(`b${b}`)) this._button(b, false);
+    };
+    root.addEventListener('pointercancel', cancel);
+    root.addEventListener('lostpointercapture', cancel);
     root.addEventListener(moveEvent, (e) => {
       if (e.pointerType === 'touch' || !this._canInput()) return;
       const p = this._toStream(e.clientX, e.clientY);
@@ -1708,7 +1776,7 @@ export class Skylight extends EventTarget {
       else if (e.deltaMode === 2) k = 10;
       const p = this._toStream(e.clientX, e.clientY);
       this._pointer(p.x, p.y);
-      if (e.ctrlKey && !this.pressedKeys.has(KEY_LEFTCTRL)) {
+      if (e.ctrlKey && !this._keyHeld(KEY_LEFTCTRL)) {
         // A trackpad pinch: forward as Ctrl+scroll, which apps treat as zoom.
         this._key(KEY_LEFTCTRL, true);
         this._scroll(e.deltaX * k, e.deltaY * k);
@@ -1734,34 +1802,36 @@ export class Skylight extends EventTarget {
       // The remote desktop repeats held keys itself.
       if (e.repeat) return;
       if (shortcut && (e.code === 'KeyC' || e.code === 'KeyX')) this._armCopy();
+      // macOS turns Caps Lock into one event per toggle, a keydown when it locks and a keyup when
+      // it unlocks: each is a whole press there. Elsewhere it is an ordinary key, down then up.
+      if (isApple && e.code === 'CapsLock') {
+        this.sendKeys([k]);
+        return;
+      }
       this._key(k, true);
       // macOS sends no keyup for keys released while Cmd is held: release them right away.
       if (isApple && e.metaKey && !MODIFIERS.has(k)) this._key(k, false);
-      if (e.code === 'CapsLock') this._key(k, false);
     });
     ime.addEventListener('keyup', (e) => {
       if (!this._canInput() || !e.code) return;
       const k = this._mapKey(e.code);
       if (k === undefined) return;
       e.preventDefault();
-      if (e.code === 'CapsLock') {
-        this._key(k, true);
-        this._key(k, false);
-        return;
-      }
-      if (this.pressedKeys.has(k)) this._key(k, false);
+      if (isApple && e.code === 'CapsLock') this.sendKeys([k]);
+      else if (this._keyHeld(k)) this._key(k, false);
     });
     ime.addEventListener('paste', (e) => {
       e.preventDefault();
       if (!this._canInput()) return;
       const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
-      if (text && this.welcome.clipboard) this._send({ t: 'clipboard', text });
-      // Then press V under the Ctrl that is already held (or a whole Ctrl+V from a menu paste),
-      // once the remote clipboard holds the text.
-      setTimeout(() => {
-        if (this.pressedKeys.has(KEY_LEFTCTRL) || this.pressedKeys.has(KEY_RIGHTCTRL)) this.sendKeys([KEYMAP.KeyV]);
-        else this.sendKeys([KEY_LEFTCTRL, KEYMAP.KeyV]);
-      }, 30);
+      if (text && this.opts.clipboard && this.welcome.clipboard) {
+        this._paste(text);
+        return;
+      }
+      // Nothing to hand over: V under the Ctrl that is already held, or a whole Ctrl+V (a menu
+      // paste), pastes what the remote clipboard holds.
+      if (this._keyHeld(KEY_LEFTCTRL) || this._keyHeld(KEY_RIGHTCTRL)) this.sendKeys([KEYMAP.KeyV]);
+      else this.sendKeys([KEY_LEFTCTRL, KEYMAP.KeyV]);
     });
     ime.addEventListener('beforeinput', (e) => {
       e.preventDefault();
@@ -1786,6 +1856,23 @@ export class Skylight extends EventTarget {
     });
 
     this._bindTouch();
+  }
+
+  /**
+   * Paste text on the remote desktop. The server sets its clipboard and then presses V itself
+   * (`paste`): the clipboard travels on the main socket and keys on the input socket, which keep
+   * no order between them, so a V sent from here could paste what the clipboard held before. Text
+   * longer than the server's `clipboardMax` once encoded as JSON (in UTF-8 bytes) is not sent,
+   * since the server would refuse it or, past its message limit, end the session; an `error`
+   * event says so.
+   */
+  _paste(text) {
+    const bytes = new TextEncoder().encode(JSON.stringify(text)).length;
+    if (bytes > (this.welcome.clipboardMax || 1 << 20)) {
+      this.dispatchEvent(new CustomEvent('error', { detail: `clipboard text too large to paste (${bytes} bytes)` }));
+      return;
+    }
+    if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'clipboard', text, paste: true }));
   }
 
   _armCopy() {

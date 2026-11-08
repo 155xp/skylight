@@ -17,7 +17,9 @@ const saved = JSON.parse(localStorage.getItem('skylight') || '{}');
 const settings = { cmdKey: 'ctrl', bitrate: '0', codec: 'h264', scale: 'fit', touchMode: 'trackpad', stats: false, ...saved };
 const save = () => localStorage.setItem('skylight', JSON.stringify(settings));
 
-const wsUrl = params.get('ws') || (() => {
+// Always this page's own server: a link must not be able to point the viewer (and the keys and
+// clipboard typed into it) at another one.
+const wsUrl = (() => {
   const u = new URL('ws', location.href);
   u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
   return u.href;

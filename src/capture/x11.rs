@@ -607,14 +607,6 @@ impl InputSink for X11Input {
             y.round() as i16,
         );
     }
-    fn pointer_rel(&self, dx: f64, dy: f64) {
-        self.fake(
-            xproto::MOTION_NOTIFY_EVENT,
-            1,
-            dx.round() as i16,
-            dy.round() as i16,
-        );
-    }
     fn button(&self, button: u32, down: bool) {
         let b = match button {
             super::BTN_LEFT => 1,

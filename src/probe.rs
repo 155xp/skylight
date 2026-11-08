@@ -16,6 +16,8 @@ use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{ConnectionExt as _, *};
 use x11rb::wrapper::ConnectionExt as _;
 
+use crate::capture::MonitorInfo;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Move,
@@ -36,19 +38,93 @@ pub enum Mode {
     Follow,
 }
 
+const MODES: [(Mode, &str); 7] = [
+    (Mode::Move, "move"),
+    (Mode::Click, "click"),
+    (Mode::Key, "key"),
+    (Mode::Animate, "animate"),
+    (Mode::Scroll, "scroll"),
+    (Mode::Page, "page"),
+    (Mode::Follow, "follow"),
+];
+
 impl Mode {
     pub fn parse(s: &str) -> Option<Mode> {
-        match s {
-            "move" => Some(Mode::Move),
-            "click" => Some(Mode::Click),
-            "key" => Some(Mode::Key),
-            "animate" => Some(Mode::Animate),
-            "scroll" => Some(Mode::Scroll),
-            "page" => Some(Mode::Page),
-            "follow" => Some(Mode::Follow),
-            _ => None,
+        MODES.iter().find(|(_, n)| *n == s).map(|(m, _)| *m)
+    }
+
+    pub fn name(self) -> &'static str {
+        MODES.iter().find(|(m, _)| *m == self).unwrap().1
+    }
+
+    /// The probe window's side, in logical pixels.
+    fn size(self) -> u32 {
+        match self {
+            Mode::Animate | Mode::Follow => 480,
+            Mode::Scroll | Mode::Page => 960,
+            Mode::Move | Mode::Click | Mode::Key => 160,
         }
     }
+}
+
+/// Open the probe window on `mon` (as `skylight probe-window`, on `display`, sharing this
+/// process's clock origin so its time codes read in server time), and return the process and
+/// where the window is, in stream pixels.
+pub async fn launch(
+    display: Option<&str>,
+    mon: &MonitorInfo,
+    mode: Mode,
+) -> Result<(tokio::process::Child, [u32; 4])> {
+    use tokio::io::AsyncBufReadExt;
+    let mut cmd = tokio::process::Command::new(std::env::current_exe()?);
+    cmd.args([
+        "probe-window",
+        "--x",
+        &(mon.x + 40).to_string(),
+        "--y",
+        &(mon.y + 40).to_string(),
+        "--size",
+        &mode.size().to_string(),
+        "--mode",
+        mode.name(),
+    ]);
+    if let Some(d) = display {
+        cmd.env("DISPLAY", d);
+    }
+    cmd.env(
+        "SKYLIGHT_CLOCK_ORIGIN_NS",
+        crate::clock::origin_monotonic_ns().to_string(),
+    );
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn()?;
+    let stdout = child.stdout.take().context("no probe stdout")?;
+    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    let line = tokio::time::timeout(std::time::Duration::from_secs(3), lines.next_line())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("the probe window did not appear (is DISPLAY set for Xwayland?)")
+        })??
+        .unwrap_or_default();
+    let v: Vec<i64> = line
+        .strip_prefix("READY ")
+        .unwrap_or("")
+        .split(' ')
+        .filter_map(|x| x.parse().ok())
+        .collect();
+    if v.len() != 4 {
+        anyhow::bail!("unexpected probe output: {line}");
+    }
+    // Root coordinates to stream pixels.
+    let s = mon.width as f64 / mon.logical_width.max(1) as f64;
+    let rect = [
+        ((v[0] - mon.x as i64).max(0) as f64 * s) as u32,
+        ((v[1] - mon.y as i64).max(0) as f64 * s) as u32,
+        (v[2] as f64 * s) as u32,
+        (v[3] as f64 * s) as u32,
+    ];
+    Ok((child, rect))
 }
 
 /// The time code: 32 cells along the top of the animated probe, each `TIMECODE_CELL` pixels wide.

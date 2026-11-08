@@ -22,7 +22,7 @@ Binary messages are little-endian. Control messages are JSON text frames with a 
     "monitors":[{"id":"HDMI-A-1","name":"…","x":0,"y":0,"logical_width":1920,
                  "logical_height":1080,"width":1920,"height":1080,"refresh_mhz":144000,"scale":1}],
     "monitor":"HDMI-A-1","scopes":["view","input"],"expires":1762183200,
-    "clipboard":true,"input":true,"inputToken":"…"}
+    "clipboard":true,"clipboardMax":1048576,"input":true,"inputToken":"…"}
    ```
    or `{"t":"error","message":"unauthorized: ticket expired"}` and a close.
 3. Before the first frame the server announces the stream, and again whenever it changes:
@@ -54,7 +54,7 @@ the compositor produced the frame; `queue_us` is capture to encode start, `encod
 | `{"t":"keyframe"}` | After a decoder error. Rate-limited to 2 per second. |
 | `{"t":"settings","maxFps":60,"maxBitrate":8000000,"codec":"hevc"}` | Any subset. Clamped to the server's limits. |
 | `{"t":"monitor","id":"DP-1"}` | Switch displays (refused if the ticket names one). |
-| `{"t":"clipboard","text":"…"}` | Set the remote clipboard (clipboard scope). |
+| `{"t":"clipboard","text":"…","paste":true}` | Set the remote clipboard (clipboard scope); with `paste` (and the input scope), also press Ctrl+V once it is set, or only V while the session holds a Ctrl. Keep the text within `clipboardMax` bytes as JSON (UTF-8, escaped): a longer text is refused with an `error`, and a message over `clipboardMax` + 4 KiB ends the session. |
 | `{"t":"input-token"}` | Ask for a fresh one-time token after the input socket closed (input scope). Answered with `{"t":"input-token","token":"…"}`; it replaces the previous token, spent or not. |
 | `{"t":"bench","action":"start","mode":"click"}` | Open the latency probe window (input scope); `mode` is `move`, `click`, `key`, `animate`, `scroll`, `page` (a page of text that turns to a new page on each click, for image quality) or `follow` (a square that follows the pointer, redrawn only when it moves). Answered with `{"t":"bench","probe":[x,y,w,h]}` in stream pixels. `"action":"stop"` closes it. In `animate`, `scroll` and `follow` modes, the top 48 rows carry a time code: 32 cells of 14×24 px, the server clock in units of 100 µs (black is a 1, most significant bit first), with the complement in the row below. |
 
@@ -82,7 +82,6 @@ at a time.
 | Type | Layout |
 |---|---|
 | `0x10` pointer absolute | `u8 type, 3×u8 0, f32 x, f32 y` in stream pixels |
-| `0x11` pointer relative | `u8 type, 3×u8 0, f32 dx, f32 dy` |
 | `0x12` button | `u8 type, u8 button (0 left, 1 middle, 2 right, 3 back, 4 forward), u8 down, u8 0` |
 | `0x13` scroll | `u8 type, 3×u8 0, f32 dx, f32 dy` in wheel notches |
 | `0x14` key | `u8 type, u8 down, u16 evdev keycode` |
@@ -91,8 +90,10 @@ at a time.
 
 Events that arrive together are injected together, with runs of pointer moves collapsed to the
 last one. The same messages are accepted on the main socket as a fallback while the input socket
-is not open. Keys outside evdev 1–248, and power and sleep keys, are dropped. Every key and button still
-held when a session ends is released.
+is not open. Keys outside evdev 1–248, power, sleep and radio (WLAN, WWAN, RFKILL) keys are
+dropped. Every key, button and touch still held when a session ends is released, and nothing is
+injected after that. (`0x11`, relative pointer motion, was removed: it could move the pointer off
+the monitor a ticket is limited to.)
 
 ## HTTP: `/api/screenshot` and `/api/wait`
 

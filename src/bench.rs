@@ -174,7 +174,7 @@ pub fn run(
         buf[y * stride..y * stride + w as usize * 4]
             .copy_from_slice(&img[y * w as usize * 4..(y + 1) * w as usize * 4]);
     }
-    let steps = crate::session::refine_steps(enc.caps());
+    let steps = crate::stream::refine_steps(enc.caps());
     for i in 0..=steps.len() {
         let label = if i == 0 {
             "change".to_string()

@@ -7,6 +7,8 @@
 //! * `x11`: any X11 server. MIT-SHM capture driven by XDamage, cursor from XFixes, input via XTEST.
 //! * `synthetic`: a moving test pattern, for tests and benchmarks without a display.
 
+#[cfg(test)]
+pub mod fake;
 pub mod kde;
 pub mod pw;
 pub mod synthetic;
@@ -58,7 +60,6 @@ pub enum TouchKind {
 /// Injects input into the desktop. Coordinates are global logical coordinates.
 pub trait InputSink: Send + Sync {
     fn pointer_abs(&self, x: f64, y: f64);
-    fn pointer_rel(&self, dx: f64, dy: f64);
     fn button(&self, button: u32, down: bool);
     /// Scroll in "wheel units": 1.0 is one notch of a regular mouse wheel.
     fn scroll(&self, dx: f64, dy: f64);
@@ -68,8 +69,14 @@ pub trait InputSink: Send + Sync {
     fn flush(&self) {}
 }
 
+/// The longest clipboard text (UTF-8 bytes) that goes either way. A viewer keeps the text it sends
+/// within this even escaped as JSON, so the message fits the socket's limit (see `server`).
+pub const CLIPBOARD_MAX: usize = 1 << 20;
+
 /// Text clipboard of the remote desktop.
 pub trait Clipboard: Send + Sync {
+    /// Put `text` on the clipboard. Input injected after this returns pastes it (see
+    /// [`crate::input::InputCtx::paste`]).
     fn set_text(&self, text: String);
     /// The latest clipboard text, updated whenever something on the desktop copies text.
     fn watch(&self) -> tokio::sync::watch::Receiver<Option<Arc<str>>>;
@@ -147,10 +154,32 @@ impl Hub {
         Ok(c)
     }
 
-    /// Replace a capture that went bad (see [`crate::health::Watchdog`]). When another session
-    /// already replaced it, that capture is shared instead of opening a third one. A monitor that
-    /// disappeared falls back to the first one left.
-    pub fn reopen(&self, old: &Arc<Capture>, reason: &str) -> Result<Arc<Capture>> {
+    /// Replace a capture that went bad (see [`crate::health::Watchdog`]) or whose monitor changed
+    /// (`now`, as it is now) or went away (`now` is `None`). One that went away is replaced by the
+    /// first monitor left, unless `pinned` (the ticket allows only that monitor): then it is an
+    /// error.
+    pub fn replace(
+        &self,
+        old: &Arc<Capture>,
+        now: Option<MonitorInfo>,
+        reason: &str,
+        pinned: bool,
+    ) -> Result<Arc<Capture>> {
+        match now {
+            None if pinned => bail!("monitor {} went away", old.monitor.id),
+            None => self.capture(&self.resolve(None)?),
+            Some(m) => self.reopen(old, m, reason),
+        }
+    }
+
+    /// Open `monitor` (where `old` was) again. When another session already replaced it, that
+    /// capture is shared instead of opening a third one.
+    fn reopen(
+        &self,
+        old: &Arc<Capture>,
+        monitor: MonitorInfo,
+        reason: &str,
+    ) -> Result<Arc<Capture>> {
         let id = &old.monitor.id;
         let mut live = self.live.lock().unwrap();
         if let Some(c) = live.get(id).and_then(Weak::upgrade)
@@ -159,7 +188,6 @@ impl Hub {
         {
             return Ok(c);
         }
-        let monitor = self.resolve(Some(id)).or_else(|_| self.resolve(None))?;
         let attempt = {
             let mut r = self.restarts.lock().unwrap();
             let n = r.entry(id.clone()).or_insert(0);
@@ -173,7 +201,7 @@ impl Hub {
         match self.backend.restart_capture(&monitor, attempt) {
             Ok(c) => {
                 let c = Arc::new(c);
-                live.insert(monitor.id.clone(), Arc::downgrade(&c));
+                live.insert(id.clone(), Arc::downgrade(&c));
                 Ok(c)
             }
             Err(e) => {
@@ -254,5 +282,36 @@ pub fn open_backend(kind: &str, synthetic_fps: u32) -> Result<Arc<dyn Backend>> 
             bail!("no capture backend worked: {}", errors.join("; "))
         }
         other => bail!("unknown backend {other} (auto, kde, x11, synthetic)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake::FakeBackend;
+    use super::*;
+
+    #[test]
+    fn a_monitor_that_went_away_is_replaced_only_when_not_pinned() {
+        let backend = Arc::new(FakeBackend::new());
+        let hub = Hub::new(backend.clone());
+        let a = hub.capture(&hub.resolve(Some("A")).unwrap()).unwrap();
+        let b = hub.capture(&hub.resolve(Some("B")).unwrap()).unwrap();
+        backend.unplug("A");
+        assert!(
+            hub.replace(&a, None, "the display went away", true)
+                .is_err()
+        );
+        // Unpinned, it moves to the monitor left, sharing the capture already running there.
+        let next = hub
+            .replace(&a, None, "the display went away", false)
+            .unwrap();
+        assert!(Arc::ptr_eq(&next, &b));
+        // A monitor still there is reopened in place, pinned or not.
+        let now = hub.resolve(Some("B")).ok();
+        let again = hub
+            .replace(&b, now, "the picture went black", true)
+            .unwrap();
+        assert_eq!(again.monitor.id, "B");
+        assert!(!Arc::ptr_eq(&again, &b));
     }
 }

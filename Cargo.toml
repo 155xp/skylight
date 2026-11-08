@@ -29,5 +29,8 @@ wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 wayland-scanner = "0.31.11"
 x11rb = { version = "0.14.0", features = ["shm", "damage", "xfixes", "xtest", "randr", "xinput"] }
 
+[dev-dependencies]
+tokio-tungstenite = "0.29.0"
+
 [profile.release]
 strip = true

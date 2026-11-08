@@ -20,13 +20,16 @@ the network; a leaked ticket or a leaked Skylight config.
   its config cannot mint access.
 - **Scopes are enforced on the server.** `view` is required. Without `input` there is no input
   socket and input messages are dropped; `clipboard` gates both directions. `mon` pins a ticket
-  to one display.
+  to one display: if that display goes away the session ends rather than show another one.
 - **Tickets stay out of logs.** A ticket travels in the first WebSocket message, never in a URL a
   proxy would log. The viewer's link carries it in the fragment and strips it on load.
 - **Origin allowlist** on both WebSocket upgrades, against cross-site WebSocket hijacking.
-- **Limits:** 5 s for an unauthenticated socket to present a ticket, at most 32 of those at once,
-  4 sessions, 2 MB messages, 1 MB clipboard. Keys outside evdev 1-248 and the power and sleep
-  keys are dropped. Every held key and button is released when a session ends.
+- **Limits:** 5 s for a new socket (on `/ws` or `/input`) to present a ticket or an input token,
+  at most 32 such sockets at once across both, 4 sessions, 1 MB clipboard text (refused with an
+  error above that), messages up to that plus 4 kB. A viewer that stops reading for 15 s is
+  disconnected, so nothing queues up for it. Keys outside evdev 1-248 and the power, sleep and
+  radio (WLAN, WWAN, RFKILL) keys are dropped. Every held key, button and touch is released when
+  a session ends, and nothing is injected after that.
 - **TLS** ends at your reverse proxy (or the private network); a TCP tunnel's relay sees only
   ciphertext. The hop to Skylight is loopback.
 - **Static pages** are `no-store` with a strict CSP (`default-src 'none'`, scripts and styles

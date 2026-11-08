@@ -1,6 +1,6 @@
 // Checks that mint-ticket.mjs still produces the exact ticket the Rust tests verify
 // (src/ticket.rs, node_minted_ticket_verifies). Ed25519 is deterministic, so any change in the
-// claim layout or encoding shows up here. Run: node --test clients/node/test/
+// claim layout or encoding shows up here. Run: node --test clients/node/test/*.mjs
 import { createPrivateKey } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';

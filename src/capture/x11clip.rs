@@ -20,8 +20,6 @@ use x11rb::{CURRENT_TIME, NONE};
 
 use super::Clipboard;
 
-const CLIP_MAX: usize = 1 << 20;
-
 x11rb::atom_manager! {
     Atoms: AtomsCookie {
         CLIPBOARD,
@@ -109,10 +107,15 @@ impl Clipboard for X11Clipboard {
         *s.offering.lock().unwrap() = Some(text.clone());
         s.watch_tx.send_replace(Some(text));
         drop(sets);
+        // A round trip: once it is back, the server owns the change, so a paste typed next (on
+        // the input connection) asks for the new text.
         let _ = s
             .conn
             .set_selection_owner(s.win, s.atoms.CLIPBOARD, CURRENT_TIME);
-        let _ = s.conn.flush();
+        let _ = s
+            .conn
+            .get_selection_owner(s.atoms.CLIPBOARD)
+            .map(|c| c.reply());
     }
 
     fn watch(&self) -> watch::Receiver<Option<Arc<str>>> {
@@ -164,7 +167,7 @@ fn run(s: &Shared) -> Result<()> {
                 let buf = incr.as_mut().unwrap();
                 if chunk.is_empty() {
                     publish(s, asked, incr.take().unwrap());
-                } else if buf.len() + chunk.len() > CLIP_MAX {
+                } else if buf.len() + chunk.len() > super::CLIPBOARD_MAX {
                     incr = None;
                 } else {
                     buf.extend_from_slice(&chunk);
@@ -185,7 +188,7 @@ fn take(s: &Shared) -> Result<xproto::GetPropertyReply> {
             s.atoms.SKYLIGHT_CLIPBOARD,
             AtomEnum::ANY,
             0,
-            (CLIP_MAX / 4 + 1) as u32,
+            (super::CLIPBOARD_MAX / 4 + 1) as u32,
         )?
         .reply()?)
 }
@@ -193,7 +196,7 @@ fn take(s: &Shared) -> Result<xproto::GetPropertyReply> {
 /// Hand a desktop selection to the sessions, unless the browser set newer text meanwhile.
 fn publish(s: &Shared, asked: u64, bytes: Vec<u8>) {
     let sets = s.sets.lock().unwrap();
-    if bytes.len() <= CLIP_MAX && *sets == asked {
+    if bytes.len() <= super::CLIPBOARD_MAX && *sets == asked {
         let text: Arc<str> = String::from_utf8_lossy(&bytes).into();
         s.watch_tx.send_replace(Some(text));
     }
@@ -306,14 +309,15 @@ mod tests {
             None
         }
 
-        /// Paste what `owner` offers.
+        /// Paste what `owner` offers. Right away: whoever set the clipboard made sure the server
+        /// took the change before returning, as a paste can follow at once.
         fn paste(&self, owner: Window) -> Option<String> {
             let a = &self.atoms;
-            // Requests from two clients reach the server in no set order: wait for the owner.
-            let until = Instant::now() + Duration::from_secs(2);
-            while self.owner() != owner && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            assert_eq!(
+                self.owner(),
+                owner,
+                "the clipboard changed hands before returning"
+            );
             self.conn
                 .convert_selection(self.win, a.CLIPBOARD, a.UTF8_STRING, a.TEXT, CURRENT_TIME)
                 .unwrap();
@@ -346,7 +350,7 @@ mod tests {
             self.conn
                 .set_selection_owner(self.win, a.CLIPBOARD, CURRENT_TIME)
                 .unwrap();
-            self.conn.flush().unwrap();
+            assert_eq!(self.owner(), self.win);
         }
 
         fn next_request(&self) -> SelectionRequestEvent {
@@ -422,5 +426,12 @@ mod tests {
         app.own();
         clip.set_text("right after".into());
         assert_eq!(app.paste(ours).as_deref(), Some("right after"));
+
+        // Over and over: the change is in place the moment set_text returns, every time.
+        for i in 0..500 {
+            app.own();
+            clip.set_text(format!("paste {i}"));
+            assert_eq!(app.owner(), ours, "round {i}");
+        }
     }
 }

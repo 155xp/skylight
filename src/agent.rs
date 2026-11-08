@@ -153,7 +153,12 @@ pub struct WaitQuery {
 
 fn parse_region(s: &str) -> Option<Rect> {
     let v: Vec<u32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-    (v.len() == 4 && v[2] > 0 && v[3] > 0).then(|| Rect::new(v[0], v[1], v[2], v[3]))
+    (v.len() == 4
+        && v[2] > 0
+        && v[3] > 0
+        && v[0].checked_add(v[2]).is_some()
+        && v[1].checked_add(v[3]).is_some())
+    .then(|| Rect::new(v[0], v[1], v[2], v[3]))
 }
 
 pub async fn wait(
@@ -288,5 +293,18 @@ fn png(px: &[u8], w: u32, h: u32, format: PixelFormat) -> anyhow::Result<Vec<u8>
         ff::av_frame_free(&mut frame);
         ff::avcodec_free_context(&mut ctx);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regions_that_wrap_around_are_refused() {
+        assert_eq!(parse_region("10,20,30,40"), Some(Rect::new(10, 20, 30, 40)));
+        assert_eq!(parse_region("4294967295,0,10,10"), None);
+        assert_eq!(parse_region("0,4294967290,10,10"), None);
+        assert_eq!(parse_region("0,0,0,10"), None);
     }
 }

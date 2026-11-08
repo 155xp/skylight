@@ -10,7 +10,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::capture::fake::FakeBackend;
 use crate::capture::{CLIPBOARD_MAX, Hub};
-use crate::protocol::{FLAG_KEY, IN_KEY, MSG_VIDEO};
+use crate::protocol::{FLAG_KEY, IN_ACK, IN_KEY, MSG_VIDEO};
 use crate::session::{App, Config};
 use crate::stream::Encoding;
 use crate::ticket::{self, Claims};
@@ -306,4 +306,35 @@ async fn a_ticket_for_a_monitor_that_is_gone_says_so() {
         "{answer}"
     );
     assert!(closes(&mut ws).await);
+}
+
+#[tokio::test]
+async fn a_pinned_monitor_missing_now_and_then_does_not_end_the_session() {
+    let s = server(4).await;
+    let (mut ws, _) = s.connect(&s.ticket(&["view"], Some("B"))).await;
+    next_json(&mut ws, is("stream")).await.unwrap();
+    // Missing from the list for a check or two, four times, with pictures in between: never
+    // three failures in a row.
+    for _ in 0..4 {
+        s.backend.unplug("B");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        s.backend.plug(crate::capture::fake::monitor("B", 320));
+        // Read and acknowledge frames for a while, as a viewer does.
+        let until = std::time::Instant::now() + Duration::from_millis(700);
+        while std::time::Instant::now() < until {
+            let m = next(&mut ws, |m| Some(m.clone()))
+                .await
+                .expect("still open");
+            match m {
+                Message::Binary(b) if b[0] == MSG_VIDEO => {
+                    let mut ack = vec![IN_ACK, 0, 0, 0];
+                    ack.extend_from_slice(&b[4..8]);
+                    ack.extend_from_slice(&0u32.to_le_bytes());
+                    ws.send(Message::binary(ack)).await.unwrap();
+                }
+                Message::Text(t) => assert!(!t.contains(r#""t":"error""#), "{t}"),
+                _ => {}
+            }
+        }
+    }
 }

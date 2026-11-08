@@ -14,11 +14,14 @@ cargo clippy --release --locked --all-targets -- -D warnings
 cargo build --release --locked
 # The X11 clipboard test needs an X server of its own (it overwrites the clipboard).
 if [ -z "${SKYLIGHT_TEST_DISPLAY:-}" ] && command -v Xvfb >/dev/null; then
-  Xvfb :93 -nolisten tcp >/dev/null 2>&1 &
+  # On a display number nobody uses: Xvfb picks it and writes it to fd 3.
+  d=$(mktemp)
+  Xvfb -displayfd 3 -nolisten tcp 3>"$d" 2>/dev/null &
   xvfb=$!
-  trap 'kill $xvfb' EXIT
-  sleep 1
-  export SKYLIGHT_TEST_DISPLAY=:93
+  trap 'kill $xvfb; rm -f "$d"' EXIT
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$d" ] && break; sleep 0.2; done
+  [ -s "$d" ] || { echo "error: Xvfb did not start" >&2; exit 1; }
+  export SKYLIGHT_TEST_DISPLAY=":$(cat "$d")"
 fi
 cargo test --release --locked
 node --test clients/node/test/

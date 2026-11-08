@@ -698,6 +698,9 @@ pub fn encoder_loop(
         }
         if source_luma >= health::BLACK_LUMA {
             dog.healthy();
+            // A real picture: earlier failed reopens (a monitor missing from one look at the
+            // list, say) were not the start of a run.
+            reopen_failures = 0;
         }
 
         // Now and then, decode a keyframe and make sure the encoder's picture is not black when

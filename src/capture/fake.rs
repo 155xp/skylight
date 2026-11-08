@@ -95,6 +95,10 @@ impl FakeBackend {
     pub fn unplug(&self, id: &str) {
         self.monitors.lock().unwrap().retain(|m| m.id != id);
     }
+
+    pub fn plug(&self, m: MonitorInfo) {
+        self.monitors.lock().unwrap().push(m);
+    }
 }
 
 impl Backend for FakeBackend {

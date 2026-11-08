@@ -345,3 +345,19 @@ async fn a_pinned_monitor_missing_now_and_then_does_not_end_the_session() {
         assert!(e.is_none(), "{e:?}");
     }
 }
+
+#[tokio::test]
+async fn a_monitor_that_changed_and_cannot_be_captured_again_ends_the_session() {
+    let s = server(4).await;
+    let (mut ws, _) = s.connect(&s.ticket(&["view"], Some("B"))).await;
+    next_json(&mut ws, is("stream")).await.unwrap();
+    // B moves, and nothing can capture it any more, while the old capture still sends pictures
+    // of where it was.
+    s.backend
+        .broken
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    s.backend.unplug("B");
+    s.backend.plug(crate::capture::fake::monitor("B", 640));
+    let e = watch_for_error(&mut ws, Duration::from_secs(5)).await;
+    assert!(e.is_some(), "still streaming the old rectangle");
+}

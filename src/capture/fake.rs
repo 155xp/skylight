@@ -64,6 +64,8 @@ pub struct FakeBackend {
     pub monitors: Mutex<Vec<MonitorInfo>>,
     pub input: Arc<Recorder>,
     pub clipboard: Arc<MemClipboard>,
+    /// Every capture opened from now on fails.
+    pub broken: std::sync::atomic::AtomicBool,
 }
 
 pub fn monitor(id: &str, x: i32) -> MonitorInfo {
@@ -89,6 +91,7 @@ impl FakeBackend {
             monitors: Mutex::new(vec![monitor("A", 0), monitor("B", 320)]),
             input: Arc::default(),
             clipboard: Arc::default(),
+            broken: Default::default(),
         }
     }
 
@@ -109,6 +112,9 @@ impl Backend for FakeBackend {
         self.monitors.lock().unwrap().clone()
     }
     fn start_capture(&self, monitor: &MonitorInfo) -> Result<Capture> {
+        if self.broken.load(std::sync::atomic::Ordering::Relaxed) {
+            bail!("capture refused");
+        }
         if !self.monitors().contains(monitor) {
             bail!("no monitor {}", monitor.id);
         }

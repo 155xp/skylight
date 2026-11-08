@@ -69,7 +69,8 @@ pub trait InputSink: Send + Sync {
     fn flush(&self) {}
 }
 
-/// The longest clipboard text (UTF-8 bytes) that goes either way.
+/// The longest clipboard text (UTF-8 bytes) that goes either way. A viewer keeps the text it sends
+/// within this even escaped as JSON, so the message fits the socket's limit (see `server`).
 pub const CLIPBOARD_MAX: usize = 1 << 20;
 
 /// Text clipboard of the remote desktop.
@@ -151,10 +152,20 @@ impl Hub {
         Ok(c)
     }
 
-    /// Replace a capture that went bad (see [`crate::health::Watchdog`]), on the same monitor
-    /// (an error if it is gone). When another session already replaced it, that capture is
+    /// Replace a capture that went bad (see [`crate::health::Watchdog`]) or whose monitor changed
+    /// or went away. One that went away is replaced by the first monitor left, unless `pinned`
+    /// (the ticket allows only that monitor): then it is an error.
+    pub fn replace(&self, old: &Arc<Capture>, reason: &str, pinned: bool) -> Result<Arc<Capture>> {
+        match self.resolve(Some(&old.monitor.id)) {
+            Err(e) if pinned => Err(e),
+            Err(_) => self.capture(&self.resolve(None)?),
+            Ok(_) => self.reopen(old, reason),
+        }
+    }
+
+    /// Open `old`'s monitor again. When another session already replaced it, that capture is
     /// shared instead of opening a third one.
-    pub fn reopen(&self, old: &Arc<Capture>, reason: &str) -> Result<Arc<Capture>> {
+    fn reopen(&self, old: &Arc<Capture>, reason: &str) -> Result<Arc<Capture>> {
         let id = &old.monitor.id;
         let mut live = self.live.lock().unwrap();
         if let Some(c) = live.get(id).and_then(Weak::upgrade)
@@ -258,5 +269,28 @@ pub fn open_backend(kind: &str, synthetic_fps: u32) -> Result<Arc<dyn Backend>> 
             bail!("no capture backend worked: {}", errors.join("; "))
         }
         other => bail!("unknown backend {other} (auto, kde, x11, synthetic)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake::FakeBackend;
+    use super::*;
+
+    #[test]
+    fn a_monitor_that_went_away_is_replaced_only_when_not_pinned() {
+        let backend = Arc::new(FakeBackend::new());
+        let hub = Hub::new(backend.clone());
+        let a = hub.capture(&hub.resolve(Some("A")).unwrap()).unwrap();
+        let b = hub.capture(&hub.resolve(Some("B")).unwrap()).unwrap();
+        backend.unplug("A");
+        assert!(hub.replace(&a, "the display went away", true).is_err());
+        // Unpinned, it moves to the monitor left, sharing the capture already running there.
+        let next = hub.replace(&a, "the display went away", false).unwrap();
+        assert!(Arc::ptr_eq(&next, &b));
+        // A monitor still there is reopened in place, pinned or not.
+        let again = hub.replace(&b, "the picture went black", true).unwrap();
+        assert_eq!(again.monitor.id, "B");
+        assert!(!Arc::ptr_eq(&again, &b));
     }
 }

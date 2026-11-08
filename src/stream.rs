@@ -99,6 +99,8 @@ struct Source {
     cursor_serial: u32,
     cursor_pos: Option<CursorPos>,
     since: Instant,
+    /// The store's frame counter when the stats last read it.
+    counted: u64,
 }
 
 impl Source {
@@ -107,6 +109,7 @@ impl Source {
     fn new(cap: Arc<Capture>, sh: &Shared) -> Source {
         let store = cap.store.clone();
         store.subscribe(&sh.sig);
+        let counted = store.lock().frames_in;
         *sh.mon.lock().unwrap() = cap.monitor.clone();
         Source {
             _pull: store.pull(),
@@ -118,6 +121,7 @@ impl Source {
             cursor_serial: u32::MAX,
             cursor_pos: None,
             since: Instant::now(),
+            counted,
         }
     }
 }
@@ -173,8 +177,7 @@ struct Stats {
     input_capture_us: u64,
     input_sent_us: u64,
     input_n: u32,
-    /// Frames the capture source delivered (counter value at the window's start, and the count).
-    frames_in_at_start: u64,
+    /// Frames the capture source delivered.
     captured: u64,
 }
 
@@ -191,7 +194,6 @@ impl Stats {
             input_capture_us: 0,
             input_sent_us: 0,
             input_n: 0,
-            frames_in_at_start: 0,
             captured: 0,
         }
     }
@@ -301,8 +303,7 @@ pub fn encoder_loop(
         }
 
         // Watchdog: replace a capture that closed, never started, went black or stopped
-        // answering the pointer, or whose monitor changed. One that went away is replaced by
-        // another monitor, unless the ticket allows only that one.
+        // answering the pointer, or whose monitor changed or went away.
         let now = Instant::now();
         if now >= next_check {
             next_check = now + Duration::from_millis(250);
@@ -316,19 +317,14 @@ pub fn encoder_loop(
                     clock::now_us(),
                 )
             };
-            let (reason, gone) = match (reason, hub.resolve(Some(&src.cap.monitor.id))) {
-                (_, Err(_)) => (Some("the display went away"), true),
-                (None, Ok(m)) if m != src.cap.monitor => (Some("the display changed"), false),
-                (r, _) => (r, false),
+            let reason = match hub.resolve(Some(&src.cap.monitor.id)) {
+                Err(_) => Some("the display went away"),
+                Ok(m) if reason.is_none() && m != src.cap.monitor => Some("the display changed"),
+                _ => reason,
             };
             if let Some(reason) = reason {
                 dog.reopened(now);
-                let next = if gone && !sh.pinned {
-                    hub.resolve(None).and_then(|m| hub.capture(&m))
-                } else {
-                    hub.reopen(&src.cap, reason)
-                };
-                match next {
+                match hub.replace(&src.cap, reason, sh.pinned) {
                     Ok(c) => {
                         reopen_failures = 0;
                         src = Source::new(c, &sh);
@@ -411,9 +407,9 @@ pub fn encoder_loop(
                 let st = src.store.lock();
                 (st.frames_in, st.luma_max)
             };
-            stats.captured = frames_in.saturating_sub(stats.frames_in_at_start);
+            stats.captured = frames_in.saturating_sub(src.counted);
+            src.counted = frames_in;
             send_stats(&out, &sh, &mut stats, enc.as_ref(), now_us, luma);
-            stats.frames_in_at_start = frames_in;
         }
 
         let (w, h, format, generation) = src.store.shape();
@@ -749,7 +745,6 @@ fn send_stats(
     let content = (s.frames - s.refines).max(1) as f64;
     let (dec_sum, dec_n) = std::mem::take(&mut *sh.decode_us.lock().unwrap());
     let p = sh.pacer.lock().unwrap();
-    let frames_in_at_start = s.frames_in_at_start;
     let v = serde_json::json!({
         "t": "stats",
         "fps": s.frames as f64 / secs,
@@ -775,7 +770,6 @@ fn send_stats(
     drop(p);
     let _ = out.send(Message::Text(v.to_string().into()));
     *s = Stats::new();
-    s.frames_in_at_start = frames_in_at_start;
 }
 
 #[cfg(test)]

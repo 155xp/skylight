@@ -59,9 +59,6 @@ const isApple = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.user
 /** A connection that brings nothing for this long (ms) is dead (see Skylight._abandon). */
 const SILENT_SERVER_MS = 4000;
 
-/** The largest message the server reads on the main socket (bytes); a bigger one ends the session. */
-const MAX_MESSAGE = 2 * 1024 * 1024;
-
 // Where the last bitrate for a server is kept: its host and path, never a query (which may hold
 // a credential).
 function rateKey(url) {
@@ -1866,19 +1863,17 @@ export class Skylight extends EventTarget {
    * Paste text on the remote desktop. The server sets its clipboard and then presses V itself
    * (`paste`): the clipboard travels on the main socket and keys on the input socket, which keep
    * no order between them, so a V sent from here could paste what the clipboard held before. Text
-   * over the server's `clipboardMax` (UTF-8 bytes), or a message over its limit (which would end
-   * the session), is not sent; an `error` event says so.
+   * longer than the server's `clipboardMax` once encoded as JSON (in UTF-8 bytes) is not sent,
+   * since the server would refuse it or, past its message limit, end the session; an `error`
+   * event says so.
    */
   _paste(text) {
-    const msg = JSON.stringify({ t: 'clipboard', text, paste: true });
-    const enc = new TextEncoder();
-    const bytes = enc.encode(text).length;
-    const max = this.welcome.clipboardMax;
-    if ((max > 0 && bytes > max) || enc.encode(msg).length > MAX_MESSAGE) {
+    const bytes = new TextEncoder().encode(JSON.stringify(text)).length;
+    if (bytes > (this.welcome.clipboardMax || 1 << 20)) {
       this.dispatchEvent(new CustomEvent('error', { detail: `clipboard text too large to paste (${bytes} bytes)` }));
       return;
     }
-    if (this.ws && this.ws.readyState === 1) this.ws.send(msg);
+    if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'clipboard', text, paste: true }));
   }
 
   _armCopy() {

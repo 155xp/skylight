@@ -26,7 +26,7 @@ the network; a leaked ticket or a leaked Skylight config.
 - **Origin allowlist** on both WebSocket upgrades, against cross-site WebSocket hijacking.
 - **Limits:** 5 s for a new socket (on `/ws` or `/input`) to present a ticket or an input token,
   at most 32 such sockets at once across both, 4 sessions, 1 MB clipboard text (refused with an
-  error above that), messages up to twice that. A viewer that stops reading for 15 s is
+  error above that), messages up to that plus 4 kB. A viewer that stops reading for 15 s is
   disconnected, so nothing queues up for it. Keys outside evdev 1-248 and the power, sleep and
   radio (WLAN, WWAN, RFKILL) keys are dropped. Every held key, button and touch is released when
   a session ends, and nothing is injected after that.

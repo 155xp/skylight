@@ -111,8 +111,8 @@ async fn ws(
     }
     let app = web.app.clone();
     upgrade
-        // A clipboard message: its text, escaped as JSON.
-        .max_message_size(2 * CLIPBOARD_MAX + 4096)
+        // The largest is a clipboard message, whose text is at most this long as JSON.
+        .max_message_size(CLIPBOARD_MAX + 4096)
         .write_buffer_size(0)
         .on_upgrade(move |socket| session::run(socket, app))
 }

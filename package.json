@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Browser-side tests and the end-to-end latency benchmark (needs Chromium).",
   "scripts": {
-    "test": "node --test clients/node/test/",
+    "test": "node --test clients/node/test/*.mjs",
     "bench": "node scripts/bench.mjs"
   },
   "devDependencies": {

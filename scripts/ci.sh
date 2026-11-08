@@ -24,7 +24,7 @@ if [ -z "${SKYLIGHT_TEST_DISPLAY:-}" ] && command -v Xvfb >/dev/null; then
   export SKYLIGHT_TEST_DISPLAY=":$(cat "$d")"
 fi
 cargo test --release --locked
-node --test clients/node/test/
+node --test clients/node/test/*.mjs
 node --check web/skylight.js
 node --check web/viewer.js
 bin=${CARGO_TARGET_DIR:-target}/release/skylight

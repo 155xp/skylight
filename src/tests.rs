@@ -294,3 +294,16 @@ async fn an_unpinned_session_moves_to_another_monitor() {
     let stream = next_json(&mut ws, is("stream")).await.unwrap();
     assert_eq!(stream["monitor"], "B");
 }
+
+#[tokio::test]
+async fn a_ticket_for_a_monitor_that_is_gone_says_so() {
+    let s = server(4).await;
+    s.backend.unplug("B");
+    let (mut ws, answer) = s.connect(&s.ticket(&["view"], Some("B"))).await;
+    assert_eq!(answer["t"], "error", "{answer}");
+    assert!(
+        answer["message"].as_str().unwrap().contains("B"),
+        "{answer}"
+    );
+    assert!(closes(&mut ws).await);
+}

@@ -155,19 +155,31 @@ impl Hub {
     }
 
     /// Replace a capture that went bad (see [`crate::health::Watchdog`]) or whose monitor changed
-    /// or went away. One that went away is replaced by the first monitor left, unless `pinned`
-    /// (the ticket allows only that monitor): then it is an error.
-    pub fn replace(&self, old: &Arc<Capture>, reason: &str, pinned: bool) -> Result<Arc<Capture>> {
-        match self.resolve(Some(&old.monitor.id)) {
-            Err(e) if pinned => Err(e),
-            Err(_) => self.capture(&self.resolve(None)?),
-            Ok(_) => self.reopen(old, reason),
+    /// (`now`, as it is now) or went away (`now` is `None`). One that went away is replaced by the
+    /// first monitor left, unless `pinned` (the ticket allows only that monitor): then it is an
+    /// error.
+    pub fn replace(
+        &self,
+        old: &Arc<Capture>,
+        now: Option<MonitorInfo>,
+        reason: &str,
+        pinned: bool,
+    ) -> Result<Arc<Capture>> {
+        match now {
+            None if pinned => bail!("monitor {} went away", old.monitor.id),
+            None => self.capture(&self.resolve(None)?),
+            Some(m) => self.reopen(old, m, reason),
         }
     }
 
-    /// Open `old`'s monitor again. When another session already replaced it, that capture is
-    /// shared instead of opening a third one.
-    fn reopen(&self, old: &Arc<Capture>, reason: &str) -> Result<Arc<Capture>> {
+    /// Open `monitor` (where `old` was) again. When another session already replaced it, that
+    /// capture is shared instead of opening a third one.
+    fn reopen(
+        &self,
+        old: &Arc<Capture>,
+        monitor: MonitorInfo,
+        reason: &str,
+    ) -> Result<Arc<Capture>> {
         let id = &old.monitor.id;
         let mut live = self.live.lock().unwrap();
         if let Some(c) = live.get(id).and_then(Weak::upgrade)
@@ -176,7 +188,6 @@ impl Hub {
         {
             return Ok(c);
         }
-        let monitor = self.resolve(Some(id))?;
         let attempt = {
             let mut r = self.restarts.lock().unwrap();
             let n = r.entry(id.clone()).or_insert(0);
@@ -286,12 +297,20 @@ mod tests {
         let a = hub.capture(&hub.resolve(Some("A")).unwrap()).unwrap();
         let b = hub.capture(&hub.resolve(Some("B")).unwrap()).unwrap();
         backend.unplug("A");
-        assert!(hub.replace(&a, "the display went away", true).is_err());
+        assert!(
+            hub.replace(&a, None, "the display went away", true)
+                .is_err()
+        );
         // Unpinned, it moves to the monitor left, sharing the capture already running there.
-        let next = hub.replace(&a, "the display went away", false).unwrap();
+        let next = hub
+            .replace(&a, None, "the display went away", false)
+            .unwrap();
         assert!(Arc::ptr_eq(&next, &b));
         // A monitor still there is reopened in place, pinned or not.
-        let again = hub.replace(&b, "the picture went black", true).unwrap();
+        let now = hub.resolve(Some("B")).ok();
+        let again = hub
+            .replace(&b, now, "the picture went black", true)
+            .unwrap();
         assert_eq!(again.monitor.id, "B");
         assert!(!Arc::ptr_eq(&again, &b));
     }

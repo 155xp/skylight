@@ -317,14 +317,15 @@ pub fn encoder_loop(
                     clock::now_us(),
                 )
             };
-            let reason = match hub.resolve(Some(&src.cap.monitor.id)) {
-                Err(_) => Some("the display went away"),
-                Ok(m) if reason.is_none() && m != src.cap.monitor => Some("the display changed"),
+            let mon = hub.resolve(Some(&src.cap.monitor.id)).ok();
+            let reason = match &mon {
+                None => Some("the display went away"),
+                Some(m) if reason.is_none() && *m != src.cap.monitor => Some("the display changed"),
                 _ => reason,
             };
             if let Some(reason) = reason {
                 dog.reopened(now);
-                match hub.replace(&src.cap, reason, sh.pinned) {
+                match hub.replace(&src.cap, mon, reason, sh.pinned) {
                     Ok(c) => {
                         reopen_failures = 0;
                         src = Source::new(c, &sh);

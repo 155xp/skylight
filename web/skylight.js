@@ -18,7 +18,6 @@ const MSG_VIDEO = 1;
 const MSG_CURSOR_SHAPE = 2;
 const MSG_CURSOR_POS = 3;
 const IN_POINTER_ABS = 0x10;
-const IN_POINTER_REL = 0x11;
 const IN_BUTTON = 0x12;
 const IN_SCROLL = 0x13;
 const IN_KEY = 0x14;

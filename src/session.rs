@@ -34,6 +34,20 @@ pub struct Config {
     pub probe_display: Option<String>,
 }
 
+impl Config {
+    /// The frame rate a viewer asked for, within this server's cap (the cap if it asked nothing).
+    fn fps(&self, asked: Option<u32>) -> u32 {
+        asked.unwrap_or(self.max_fps).clamp(1, self.max_fps)
+    }
+
+    /// The bitrate cap a viewer asked for, within this server's range.
+    fn bitrate(&self, asked: Option<u64>) -> u64 {
+        asked
+            .unwrap_or(self.max_bitrate)
+            .clamp(self.min_bitrate, self.max_bitrate)
+    }
+}
+
 /// Sockets, on either endpoint, that have not shown a ticket or an input token yet.
 const MAX_PENDING: usize = 32;
 /// How long a new socket has to show one.
@@ -272,24 +286,26 @@ async fn serve(
     hello: Hello,
 ) -> anyhow::Result<()> {
     // A ticket that names a monitor gets that one; otherwise the one asked for, while it exists.
-    let mon = match &claims.mon {
-        Some(id) => app.hub.resolve(Some(id))?,
+    let opened = match &claims.mon {
+        Some(id) => app.hub.resolve(Some(id)),
         None => app
             .hub
             .resolve(hello.monitor.as_deref())
-            .or_else(|_| app.hub.resolve(None))?,
+            .or_else(|_| app.hub.resolve(None)),
+    }
+    .and_then(|mon| Ok((app.hub.capture(&mon)?, mon)));
+    let (cap, mon) = match opened {
+        Ok(o) => o,
+        Err(e) => {
+            // The viewer shows why, rather than that it could not connect.
+            let _ = sink.send(error(&format!("capture: {e:#}"))).await;
+            return Err(e);
+        }
     };
-    let cap = app.hub.capture(&mon)?;
     let monitors = app.hub.monitors();
 
-    let fps = hello
-        .max_fps
-        .unwrap_or(app.config.max_fps)
-        .clamp(1, app.config.max_fps);
-    let max_bps = hello
-        .max_bitrate
-        .unwrap_or(app.config.max_bitrate)
-        .clamp(app.config.min_bitrate, app.config.max_bitrate);
+    let fps = app.config.fps(hello.max_fps);
+    let max_bps = app.config.bitrate(hello.max_bitrate);
     let shared = Arc::new(Shared::new(
         Pacer::new(
             hello.start_bitrate.unwrap_or(app.config.start_bitrate),
@@ -394,8 +410,8 @@ async fn serve(
                             }
                             ClientMsg::Settings { max_fps, max_bitrate, codec } => {
                                 shared.send(Cmd::Settings {
-                                    max_fps: max_fps.map(|f| f.clamp(1, app.config.max_fps)),
-                                    max_bitrate: max_bitrate.map(|b| b.clamp(app.config.min_bitrate, app.config.max_bitrate)),
+                                    max_fps: max_fps.map(|f| app.config.fps(Some(f))),
+                                    max_bitrate: max_bitrate.map(|b| app.config.bitrate(Some(b))),
                                     codec: codec.as_deref().and_then(|c| app.pick_codec([c])),
                                 });
                             }

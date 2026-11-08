@@ -12,6 +12,7 @@ use crate::capture::fake::FakeBackend;
 use crate::capture::{CLIPBOARD_MAX, Hub};
 use crate::protocol::{FLAG_KEY, IN_KEY, MSG_VIDEO};
 use crate::session::{App, Config};
+use crate::stream::Encoding;
 use crate::ticket::{self, Claims};
 use crate::{clock, encode};
 
@@ -32,15 +33,17 @@ async fn server(max_sessions: usize) -> Server {
         ticket::Verifier::new(vec![key.verifying_key()], "test".into()),
         Config {
             max_fps: 30,
-            remote_max_fps: 0,
             max_bitrate: 8_000_000,
             start_bitrate: 4_000_000,
             min_bitrate: 500_000,
-            encoder: encode::Backend::Software,
-            nvenc_preset: 2,
-            vbv_ms: 34,
-            cq: Some(23),
-            refine: true,
+            encoding: Encoding {
+                encoder: encode::Backend::Software,
+                nvenc_preset: 2,
+                vbv_ms: 34,
+                cq: Some(23),
+                refine: true,
+                remote_max_fps: 0,
+            },
             allowed_origins: Vec::new(),
             max_sessions,
             probe_display: None,

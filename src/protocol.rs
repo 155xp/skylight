@@ -270,6 +270,11 @@ pub fn json(m: &ServerMsg) -> String {
     serde_json::to_string(m).expect("server message serializes")
 }
 
+/// `m` as a WebSocket text message.
+pub fn message(m: &ServerMsg) -> axum::extract::ws::Message {
+    axum::extract::ws::Message::Text(json(m).into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

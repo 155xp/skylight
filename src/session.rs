@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{FutureExt, SinkExt, StreamExt};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::capture::{CLIPBOARD_MAX, Hub};
 use crate::clock;
-use crate::encode::{self, Codec};
+use crate::encode::Codec;
 use crate::frame::WAKE_STOP;
 use crate::input::InputCtx;
 use crate::pacer::Pacer;
@@ -23,18 +24,10 @@ use crate::ticket::{self, Claims, Verifier};
 
 pub struct Config {
     pub max_fps: u32,
-    /// Frame-rate cap for viewers whose best round trip is over `stream::REMOTE_RTT_US`; 0 for
-    /// none.
-    pub remote_max_fps: u32,
     pub max_bitrate: u64,
     pub start_bitrate: u64,
     pub min_bitrate: u64,
-    pub encoder: encode::Backend,
-    pub nvenc_preset: u8,
-    pub vbv_ms: u32,
-    /// Constant-quality target under the bitrate cap; `None` for plain CBR.
-    pub cq: Option<u8>,
-    pub refine: bool,
+    pub encoding: stream::Encoding,
     pub allowed_origins: Vec<String>,
     pub max_sessions: usize,
     /// X display for the latency probe window (`skylight probe-window`).
@@ -120,12 +113,26 @@ async fn first_text(stream: &mut futures_util::stream::SplitStream<WebSocket>) -
     }
 }
 
-pub fn text(s: String) -> Message {
-    Message::Text(s.into())
+fn error(message: &str) -> Message {
+    proto::message(&ServerMsg::Error { message })
 }
 
-fn error(message: &str) -> Message {
-    text(proto::json(&ServerMsg::Error { message }))
+/// Send everything queued for a socket, in order, until the queue closes or a send takes longer
+/// than `timeout`. The receiver goes with it, so senders then see the socket as closed.
+async fn forward<S>(mut sink: S, mut rx: UnboundedReceiver<Message>, timeout: Duration)
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    while let Some(m) = rx.recv().await {
+        if !matches!(
+            tokio::time::timeout(timeout, sink.send(m)).await,
+            Ok(Ok(()))
+        ) {
+            // Closing would flush to the same peer that stopped reading: just drop it.
+            return;
+        }
+    }
+    let _ = tokio::time::timeout(timeout, sink.close()).await;
 }
 
 /// The input socket: authenticated by a one-time token (from `welcome`, or a fresh one from an
@@ -291,6 +298,7 @@ async fn serve(
             fps,
         ),
         mon.clone(),
+        claims.mon.is_some(),
     ));
 
     let mut input = claims
@@ -319,20 +327,10 @@ async fn serve(
         input: input.is_some(),
         input_token: input.as_ref().map(|i| i.token.as_str()),
     };
-    sink.send(text(proto::json(&welcome))).await?;
+    sink.send(proto::message(&welcome)).await?;
 
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-    let writer = tokio::spawn(async move {
-        while let Some(m) = out_rx.recv().await {
-            if !matches!(
-                tokio::time::timeout(WRITE_TIMEOUT, sink.send(m)).await,
-                Ok(Ok(()))
-            ) {
-                break;
-            }
-        }
-        let _ = sink.close().await;
-    });
+    let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let writer = tokio::spawn(forward(sink, out_rx, WRITE_TIMEOUT));
 
     // The encoder thread owns the session's only reference to its capture, so a capture it
     // replaces (see `Hub::reopen`) closes as soon as the last session lets go of it. When it ends
@@ -343,12 +341,11 @@ async fn serve(
         let codec = app
             .pick_codec(hello.codecs.iter().map(String::as_str))
             .unwrap_or(Codec::H264);
-        let pinned = claims.mon.is_some();
         std::thread::Builder::new()
             .name("encoder".into())
             .spawn(move || {
                 let _done = enc_done_tx;
-                stream::encoder_loop(shared, cap, out, codec, fps, &app, pinned)
+                stream::encoder_loop(shared, cap, out, codec, fps, &app.hub, &app.config.encoding)
             })?
     };
 
@@ -384,7 +381,7 @@ async fn serve(
                         let Ok(cm) = serde_json::from_str::<ClientMsg>(&t) else { continue };
                         match cm {
                             ClientMsg::Ping { id, c } => {
-                                let _ = out_tx.send(text(proto::json(&ServerMsg::Pong { id, c, s: clock::now_us() })));
+                                let _ = out_tx.send(proto::message(&ServerMsg::Pong { id, c, s: clock::now_us() }));
                             }
                             ClientMsg::Keyframe => {
                                 if last_keyframe_req.elapsed() > Duration::from_millis(500) {
@@ -445,7 +442,7 @@ async fn serve(
                                             Err(e) => ServerMsg::Bench { probe: None, error: Some(format!("{e:#}")) },
                                         }
                                     };
-                                    let _ = out_tx.send(text(proto::json(&msg)));
+                                    let _ = out_tx.send(proto::message(&msg));
                                 }
                             }
                             ClientMsg::InputToken => {
@@ -454,7 +451,7 @@ async fn serve(
                                 // socket meanwhile.
                                 if let Some(i) = &mut input {
                                     let token = i.renew();
-                                    let _ = out_tx.send(text(proto::json(&ServerMsg::InputToken { token })));
+                                    let _ = out_tx.send(proto::message(&ServerMsg::InputToken { token }));
                                 }
                             }
                             ClientMsg::Hello(_) => {}
@@ -471,7 +468,7 @@ async fn serve(
                 }
                 let t = clip_rx.as_mut().unwrap().borrow_and_update().clone();
                 if let Some(t) = t {
-                    let _ = out_tx.send(text(proto::json(&ServerMsg::Clipboard { text: &t })));
+                    let _ = out_tx.send(proto::message(&ServerMsg::Clipboard { text: &t }));
                 }
             }
             _ = &mut enc_done => break Err(anyhow::anyhow!("the stream ended")),
@@ -493,4 +490,59 @@ async fn serve(
     drop(out_tx);
     let _ = writer.await;
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A peer that never takes anything.
+    struct Stuck;
+
+    impl futures_util::Sink<Message> for Stuck {
+        type Error = ();
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ()>> {
+            std::task::Poll::Pending
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, _: Message) -> Result<(), ()> {
+            Ok(())
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ()>> {
+            std::task::Poll::Pending
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_stops_reading_is_let_go() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Message::Text("x".into())).unwrap();
+        let t = Duration::from_millis(50);
+        tokio::time::timeout(t * 4, forward(Stuck, rx, t))
+            .await
+            .expect("gave up on the stuck peer");
+        // The queue went with it, so the encoder sees the socket as closed and stops.
+        assert!(tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn closing_a_stuck_peer_does_not_hang_either() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(tx);
+        let t = Duration::from_millis(50);
+        tokio::time::timeout(t * 4, forward(Stuck, rx, t))
+            .await
+            .expect("did not wait on close forever");
+    }
 }

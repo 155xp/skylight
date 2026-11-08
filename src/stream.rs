@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use axum::extract::ws::Message;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::capture::{Capture, MonitorInfo};
+use crate::capture::{Capture, Hub, MonitorInfo};
 use crate::clock;
 use crate::encode::{self, Codec, EncoderParams, RateChange, VideoEncoder};
 use crate::frame::{CursorPos, FrameStore, PullGuard, Signal, WAKE_COMMAND, WAKE_STOP};
@@ -20,7 +20,19 @@ use crate::input::Activity;
 use crate::nvenc::FrameOpts;
 use crate::pacer::Pacer;
 use crate::protocol::{self as proto, ServerMsg};
-use crate::session::{App, text};
+
+/// How a server encodes, for every session.
+pub struct Encoding {
+    pub encoder: encode::Backend,
+    pub nvenc_preset: u8,
+    pub vbv_ms: u32,
+    /// Constant-quality target under the bitrate cap; `None` for plain CBR.
+    pub cq: Option<u8>,
+    /// Sharpen a still picture after motion (see `REFINE_AFTER`).
+    pub refine: bool,
+    /// Frame-rate cap for viewers whose best round trip is over `REMOTE_RTT_US`; 0 for none.
+    pub remote_max_fps: u32,
+}
 
 pub enum Cmd {
     Keyframe,
@@ -41,17 +53,21 @@ pub struct Shared {
     /// The monitor on screen, set by the encoder whenever it starts on a capture, so input maps
     /// to the picture the viewer sees.
     pub mon: Arc<Mutex<MonitorInfo>>,
+    /// The ticket names this monitor, so when it goes away the session ends rather than show
+    /// another one.
+    pinned: bool,
     pub activity: Arc<Activity>,
 }
 
 impl Shared {
-    pub fn new(pacer: Pacer, mon: MonitorInfo) -> Shared {
+    pub fn new(pacer: Pacer, mon: MonitorInfo, pinned: bool) -> Shared {
         Shared {
             sig: Signal::new(),
             cmds: Mutex::new(VecDeque::new()),
             pacer: Mutex::new(pacer),
             decode_us: Mutex::new((0, 0)),
             mon: Arc::new(Mutex::new(mon)),
+            pinned,
             activity: Activity::new(),
         }
     }
@@ -203,18 +219,16 @@ const OUTPUT_CHECK_EVERY: Duration = Duration::from_secs(30);
 const MAX_REOPEN_FAILURES: u32 = 3;
 
 /// Stream `cap` to `out` until the session stops it (`WAKE_STOP`), the socket closes, or nothing
-/// can be captured or encoded any more (then an `error` goes out first). `pinned`: the ticket
-/// names this monitor, so when it goes away the session ends rather than show another one.
+/// can be captured or encoded any more (then an `error` goes out first).
 pub fn encoder_loop(
     sh: Arc<Shared>,
     cap: Arc<Capture>,
     out: UnboundedSender<Message>,
     mut codec: Codec,
     mut fps: u32,
-    app: &App,
-    pinned: bool,
+    hub: &Hub,
+    cfg: &Encoding,
 ) {
-    let cfg = &app.config;
     let last_input_us = &sh.activity.any_us;
     let mut src = Source::new(cap, &sh);
     let mut last_request = Instant::now() - Duration::from_secs(1);
@@ -302,17 +316,17 @@ pub fn encoder_loop(
                     clock::now_us(),
                 )
             };
-            let (reason, gone) = match (reason, app.hub.resolve(Some(&src.cap.monitor.id))) {
+            let (reason, gone) = match (reason, hub.resolve(Some(&src.cap.monitor.id))) {
                 (_, Err(_)) => (Some("the display went away"), true),
                 (None, Ok(m)) if m != src.cap.monitor => (Some("the display changed"), false),
                 (r, _) => (r, false),
             };
             if let Some(reason) = reason {
                 dog.reopened(now);
-                let next = if gone && !pinned {
-                    app.hub.resolve(None).and_then(|m| app.hub.capture(&m))
+                let next = if gone && !sh.pinned {
+                    hub.resolve(None).and_then(|m| hub.capture(&m))
                 } else {
-                    app.hub.reopen(&src.cap, reason)
+                    hub.reopen(&src.cap, reason)
                 };
                 match next {
                     Ok(c) => {
@@ -324,8 +338,8 @@ pub fn encoder_loop(
                         reopen_failures += 1;
                         if reopen_failures >= MAX_REOPEN_FAILURES {
                             let message = format!("capture: {e:#}");
-                            let _ = out
-                                .send(text(proto::json(&ServerMsg::Error { message: &message })));
+                            let _ =
+                                out.send(proto::message(&ServerMsg::Error { message: &message }));
                             return;
                         }
                     }
@@ -528,9 +542,9 @@ pub fn encoder_loop(
                     last_output_check = None;
                 }
                 Err(e) => {
-                    let _ = out.send(text(proto::json(&ServerMsg::Error {
+                    let _ = out.send(proto::message(&ServerMsg::Error {
                         message: &format!("encoder: {e:#}"),
-                    })));
+                    }));
                     return;
                 }
             }
@@ -551,7 +565,7 @@ pub fn encoder_loop(
                 fps,
                 monitor: &mon_id,
             };
-            let _ = out.send(text(proto::json(&m)));
+            let _ = out.send(proto::message(&m));
         }
 
         let source_luma = src.store.lock().luma_max;
@@ -607,7 +621,7 @@ pub fn encoder_loop(
                 if *n >= ENCODER_STRIKES {
                     *n = 0;
                     skip.insert(e.id, Instant::now() + ENCODER_TIMEOUT);
-                    app.hub.incidents.record(
+                    hub.incidents.record(
                         &src.cap.monitor.id,
                         format!("encoder {name} keeps failing ({err:#}); trying the next one"),
                     );
@@ -706,7 +720,7 @@ pub fn encoder_loop(
                 if got.is_none_or(|l| l < health::BLACK_LUMA) {
                     let name = e.name.clone();
                     skip.insert(e.id, Instant::now() + ENCODER_TIMEOUT);
-                    app.hub.incidents.record(
+                    hub.incidents.record(
                         &src.cap.monitor.id,
                         match got {
                             Some(l) => format!(
@@ -759,7 +773,7 @@ fn send_stats(
         "lumaMax": luma_max,
     });
     drop(p);
-    let _ = out.send(text(v.to_string()));
+    let _ = out.send(Message::Text(v.to_string().into()));
     *s = Stats::new();
     s.frames_in_at_start = frames_in_at_start;
 }

@@ -186,7 +186,10 @@ impl InputCtx {
     /// Inject a batch in order, with runs of pointer moves collapsed to the last one (a backlog
     /// of moves is only worth its end point), then flush once.
     pub fn handle_batch(&self, batch: Vec<Input>) {
-        let mut held = self.held.lock().unwrap();
+        self.inject_held(&mut self.held.lock().unwrap(), batch);
+    }
+
+    fn inject_held(&self, held: &mut Held, batch: Vec<Input>) {
         if held.closed {
             return;
         }
@@ -199,7 +202,7 @@ impl InputCtx {
             {
                 continue;
             }
-            inject(self.sink.as_ref(), &mon, inp, &mut held);
+            inject(self.sink.as_ref(), &mon, inp, held);
         }
         self.sink.flush();
     }
@@ -207,17 +210,16 @@ impl InputCtx {
     /// Paste what the session just put on the clipboard: V under a Ctrl the viewer already holds,
     /// or a whole Ctrl+V. Sent from here, after the clipboard was set, so the two keep their order.
     pub fn paste(&self) {
-        let ctrl = {
-            let held = self.held.lock().unwrap();
-            held.keys.contains(&KEY_LEFTCTRL) || held.keys.contains(&KEY_RIGHTCTRL)
-        };
+        // One lock throughout, so a Ctrl released meanwhile cannot turn this into a bare V.
+        let mut held = self.held.lock().unwrap();
+        let ctrl = held.keys.contains(&KEY_LEFTCTRL) || held.keys.contains(&KEY_RIGHTCTRL);
         let key = |code, down| Input::Key { code, down };
         let mut keys = vec![key(KEY_V as u16, true), key(KEY_V as u16, false)];
         if !ctrl {
             keys.insert(0, key(KEY_LEFTCTRL as u16, true));
             keys.push(key(KEY_LEFTCTRL as u16, false));
         }
-        self.handle_batch(keys);
+        self.inject_held(&mut held, keys);
     }
 
     /// Release everything held and refuse any input from now on.

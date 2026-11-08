@@ -20,8 +20,6 @@ use x11rb::{CURRENT_TIME, NONE};
 
 use super::Clipboard;
 
-const CLIP_MAX: usize = 1 << 20;
-
 x11rb::atom_manager! {
     Atoms: AtomsCookie {
         CLIPBOARD,
@@ -164,7 +162,7 @@ fn run(s: &Shared) -> Result<()> {
                 let buf = incr.as_mut().unwrap();
                 if chunk.is_empty() {
                     publish(s, asked, incr.take().unwrap());
-                } else if buf.len() + chunk.len() > CLIP_MAX {
+                } else if buf.len() + chunk.len() > super::CLIPBOARD_MAX {
                     incr = None;
                 } else {
                     buf.extend_from_slice(&chunk);
@@ -185,7 +183,7 @@ fn take(s: &Shared) -> Result<xproto::GetPropertyReply> {
             s.atoms.SKYLIGHT_CLIPBOARD,
             AtomEnum::ANY,
             0,
-            (CLIP_MAX / 4 + 1) as u32,
+            (super::CLIPBOARD_MAX / 4 + 1) as u32,
         )?
         .reply()?)
 }
@@ -193,7 +191,7 @@ fn take(s: &Shared) -> Result<xproto::GetPropertyReply> {
 /// Hand a desktop selection to the sessions, unless the browser set newer text meanwhile.
 fn publish(s: &Shared, asked: u64, bytes: Vec<u8>) {
     let sets = s.sets.lock().unwrap();
-    if bytes.len() <= CLIP_MAX && *sets == asked {
+    if bytes.len() <= super::CLIPBOARD_MAX && *sets == asked {
         let text: Arc<str> = String::from_utf8_lossy(&bytes).into();
         s.watch_tx.send_replace(Some(text));
     }

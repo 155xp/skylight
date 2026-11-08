@@ -7,6 +7,8 @@
 //! * `x11`: any X11 server. MIT-SHM capture driven by XDamage, cursor from XFixes, input via XTEST.
 //! * `synthetic`: a moving test pattern, for tests and benchmarks without a display.
 
+#[cfg(test)]
+pub mod fake;
 pub mod kde;
 pub mod pw;
 pub mod synthetic;
@@ -58,7 +60,6 @@ pub enum TouchKind {
 /// Injects input into the desktop. Coordinates are global logical coordinates.
 pub trait InputSink: Send + Sync {
     fn pointer_abs(&self, x: f64, y: f64);
-    fn pointer_rel(&self, dx: f64, dy: f64);
     fn button(&self, button: u32, down: bool);
     /// Scroll in "wheel units": 1.0 is one notch of a regular mouse wheel.
     fn scroll(&self, dx: f64, dy: f64);
@@ -67,6 +68,9 @@ pub trait InputSink: Send + Sync {
     fn touch(&self, kind: TouchKind, id: u32, x: f64, y: f64);
     fn flush(&self) {}
 }
+
+/// The longest clipboard text (UTF-8 bytes) that goes either way.
+pub const CLIPBOARD_MAX: usize = 1 << 20;
 
 /// Text clipboard of the remote desktop.
 pub trait Clipboard: Send + Sync {
@@ -147,9 +151,9 @@ impl Hub {
         Ok(c)
     }
 
-    /// Replace a capture that went bad (see [`crate::health::Watchdog`]). When another session
-    /// already replaced it, that capture is shared instead of opening a third one. A monitor that
-    /// disappeared falls back to the first one left.
+    /// Replace a capture that went bad (see [`crate::health::Watchdog`]), on the same monitor
+    /// (an error if it is gone). When another session already replaced it, that capture is
+    /// shared instead of opening a third one.
     pub fn reopen(&self, old: &Arc<Capture>, reason: &str) -> Result<Arc<Capture>> {
         let id = &old.monitor.id;
         let mut live = self.live.lock().unwrap();
@@ -159,7 +163,7 @@ impl Hub {
         {
             return Ok(c);
         }
-        let monitor = self.resolve(Some(id)).or_else(|_| self.resolve(None))?;
+        let monitor = self.resolve(Some(id))?;
         let attempt = {
             let mut r = self.restarts.lock().unwrap();
             let n = r.entry(id.clone()).or_insert(0);
@@ -173,7 +177,7 @@ impl Hub {
         match self.backend.restart_capture(&monitor, attempt) {
             Ok(c) => {
                 let c = Arc::new(c);
-                live.insert(monitor.id.clone(), Arc::downgrade(&c));
+                live.insert(id.clone(), Arc::downgrade(&c));
                 Ok(c)
             }
             Err(e) => {

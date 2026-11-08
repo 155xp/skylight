@@ -65,7 +65,7 @@ res.json({
 
 To offer a view-only screen, mint `['view']`: Skylight then refuses all input for that session
 on the server, whatever the page does. `mon` (a connector name such as `HDMI-A-1`) pins a ticket
-to one display. The full claim format is in [docs/PROTOCOL.md](docs/PROTOCOL.md) and
+to one display; if it goes away, the session ends instead of showing another one. The full claim format is in [docs/PROTOCOL.md](docs/PROTOCOL.md) and
 `src/ticket.rs`.
 
 ## 3. The browser component

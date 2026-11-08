@@ -33,6 +33,15 @@ impl Codec {
         }
     }
 
+    /// The name the protocol uses (`stream`, `settings`, `codecs` in `hello`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Codec::H264 => "h264",
+            Codec::Hevc => "hevc",
+            Codec::Av1 => "av1",
+        }
+    }
+
     pub fn id(self) -> u8 {
         match self {
             Codec::H264 => 1,
@@ -42,7 +51,7 @@ impl Codec {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
     Auto,
@@ -180,6 +189,8 @@ pub struct VideoEncoder {
     hw_device: *mut ff::AVBufferRef,
     pkt: *mut ff::AVPacket,
     pts: i64,
+    /// Which of [`candidates`] this is, to skip it by (`name` can say more, such as the codec).
+    pub id: &'static str,
     pub name: String,
     pub hardware: bool,
     pub codec: Codec,
@@ -297,8 +308,16 @@ fn vaapi_nodes() -> Vec<String> {
 impl VideoEncoder {
     /// Open the best available encoder for `p`, falling back down the list.
     pub fn open(p: &EncoderParams) -> Result<VideoEncoder> {
+        Self::open_avoiding(p, |_| false)
+    }
+
+    /// Like [`VideoEncoder::open`], but the encoders `avoid` names (by `id`) come last, tried
+    /// only when nothing else opens.
+    pub fn open_avoiding(p: &EncoderParams, avoid: impl Fn(&str) -> bool) -> Result<VideoEncoder> {
+        let mut names = candidates(p.codec, p.backend);
+        names.sort_by_key(|n| avoid(n));
         let mut errors = Vec::new();
-        for name in candidates(p.codec, p.backend) {
+        for name in names {
             match Self::open_named(name, p) {
                 Ok(e) => return Ok(e),
                 Err(e) => errors.push(format!("{name}: {e:#}")),
@@ -307,7 +326,7 @@ impl VideoEncoder {
         bail!("no usable {:?} encoder ({})", p.codec, errors.join("; "))
     }
 
-    pub fn open_named(name: &str, p: &EncoderParams) -> Result<VideoEncoder> {
+    pub fn open_named(name: &'static str, p: &EncoderParams) -> Result<VideoEncoder> {
         if p.width < 16 || p.height < 16 || p.width > 8192 || p.height > 8192 {
             bail!("unsupported size {}x{}", p.width, p.height);
         }
@@ -333,7 +352,7 @@ impl VideoEncoder {
     }
 
     fn open_ffmpeg(
-        name: &str,
+        name: &'static str,
         p: &EncoderParams,
         vaapi: Option<(&str, &str)>,
     ) -> Result<VideoEncoder> {
@@ -355,6 +374,7 @@ impl VideoEncoder {
                 hw_device: ptr::null_mut(),
                 pkt: ptr::null_mut(),
                 pts: 0,
+                id: "nvenc",
                 name: match p.codec {
                     Codec::H264 => "nvenc-h264",
                     Codec::Hevc => "nvenc-hevc",
@@ -394,6 +414,7 @@ impl VideoEncoder {
             hw_device: ptr::null_mut(),
             pkt: ptr::null_mut(),
             pts: 0,
+            id: name,
             name: name.to_string(),
             hardware,
             codec: p.codec,

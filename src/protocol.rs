@@ -16,7 +16,6 @@ pub const FLAG_REFINE: u8 = 2;
 
 // Client to server.
 pub const IN_POINTER_ABS: u8 = 0x10;
-pub const IN_POINTER_REL: u8 = 0x11;
 pub const IN_BUTTON: u8 = 0x12;
 pub const IN_SCROLL: u8 = 0x13;
 pub const IN_KEY: u8 = 0x14;
@@ -85,10 +84,6 @@ pub enum Input {
         x: f32,
         y: f32,
     },
-    PointerRel {
-        dx: f32,
-        dy: f32,
-    },
     /// 0 left, 1 middle, 2 right, 3 back, 4 forward.
     Button {
         button: u8,
@@ -131,10 +126,6 @@ pub fn parse_input(b: &[u8]) -> Option<Input> {
             x: f32_at(b, 4)?,
             y: f32_at(b, 8)?,
         },
-        IN_POINTER_REL => Input::PointerRel {
-            dx: f32_at(b, 4)?,
-            dy: f32_at(b, 8)?,
-        },
         IN_BUTTON => Input::Button {
             button: *b.get(1)?,
             down: *b.get(2)? != 0,
@@ -168,22 +159,25 @@ pub fn parse_input(b: &[u8]) -> Option<Input> {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct Hello {
+    pub ticket: String,
+    #[serde(default)]
+    pub codecs: Vec<String>,
+    #[serde(default, rename = "maxFps")]
+    pub max_fps: Option<u32>,
+    #[serde(default)]
+    pub monitor: Option<String>,
+    #[serde(default, rename = "maxBitrate")]
+    pub max_bitrate: Option<u64>,
+    /// Where the last session to this server settled (bit/s), to start from instead.
+    #[serde(default, rename = "startBitrate")]
+    pub start_bitrate: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum ClientMsg {
-    Hello {
-        ticket: String,
-        #[serde(default)]
-        codecs: Vec<String>,
-        #[serde(default, rename = "maxFps")]
-        max_fps: Option<u32>,
-        #[serde(default)]
-        monitor: Option<String>,
-        #[serde(default, rename = "maxBitrate")]
-        max_bitrate: Option<u64>,
-        /// Where the last session to this server settled (bit/s), to start from instead.
-        #[serde(default, rename = "startBitrate")]
-        start_bitrate: Option<u64>,
-    },
+    Hello(Hello),
     Ping {
         id: u64,
         c: f64,
@@ -202,6 +196,9 @@ pub enum ClientMsg {
     Keyframe,
     Clipboard {
         text: String,
+        /// Paste it too, once it is on the clipboard (see [`crate::input::InputCtx::paste`]).
+        #[serde(default)]
+        paste: bool,
     },
     Bench {
         action: String,
@@ -231,6 +228,9 @@ pub enum ServerMsg<'a> {
         scopes: &'a [String],
         expires: u64,
         clipboard: bool,
+        /// The longest clipboard text (UTF-8 bytes) the session accepts.
+        #[serde(rename = "clipboardMax")]
+        clipboard_max: usize,
         input: bool,
         /// One-time token that attaches the separate input socket (`/input`) to this session.
         #[serde(rename = "inputToken", skip_serializing_if = "Option::is_none")]
@@ -344,11 +344,11 @@ mod tests {
         .unwrap();
         assert!(matches!(
             m,
-            ClientMsg::Hello {
+            ClientMsg::Hello(Hello {
                 max_fps: Some(120),
                 start_bitrate: Some(2_400_000),
                 ..
-            }
+            })
         ));
     }
 }

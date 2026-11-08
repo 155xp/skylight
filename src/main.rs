@@ -15,15 +15,20 @@ mod probe;
 mod protocol;
 mod server;
 mod session;
+mod stream;
+#[cfg(test)]
+mod tests;
 mod ticket;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
+
+/// The lowest bitrate the controller goes down to; `--max-mbps` may not be below it.
+const MIN_MBPS: f64 = 0.5;
 
 #[derive(Parser)]
 #[command(
@@ -34,25 +39,6 @@ use clap::{Parser, Subcommand, ValueEnum};
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum EncoderArg {
-    Auto,
-    Nvenc,
-    Vaapi,
-    Software,
-}
-
-impl From<EncoderArg> for encode::Backend {
-    fn from(e: EncoderArg) -> Self {
-        match e {
-            EncoderArg::Auto => encode::Backend::Auto,
-            EncoderArg::Nvenc => encode::Backend::Nvenc,
-            EncoderArg::Vaapi => encode::Backend::Vaapi,
-            EncoderArg::Software => encode::Backend::Software,
-        }
-    }
 }
 
 #[derive(Subcommand)]
@@ -79,7 +65,7 @@ enum Cmd {
         backend: String,
         /// Which encoder family to use; `auto` tries NVENC, then VA-API, then software.
         #[arg(long, value_enum, default_value = "auto", env = "SKYLIGHT_ENCODER")]
-        encoder: EncoderArg,
+        encoder: encode::Backend,
         /// Frame-rate cap; clients may ask for less.
         #[arg(long, default_value_t = 144)]
         max_fps: u32,
@@ -156,7 +142,7 @@ enum Cmd {
         seconds: u64,
         /// Which encoder family to use; `auto` tries NVENC, then VA-API, then software.
         #[arg(long, value_enum, default_value = "auto", env = "SKYLIGHT_ENCODER")]
-        encoder: EncoderArg,
+        encoder: encode::Backend,
         #[arg(long, default_value = "h264")]
         codec: String,
         #[arg(long, default_value_t = 20.0)]
@@ -225,8 +211,13 @@ fn main() -> Result<()> {
             probe_display,
             web_dir,
         } => {
-            if !listen.ip().is_loopback() {
-                bail!("--listen must be a loopback address (got {listen})");
+            if max_fps == 0 || max_sessions == 0 {
+                bail!("--max-fps and --max-sessions must be at least 1");
+            }
+            if !(max_mbps.is_finite() && max_mbps >= MIN_MBPS)
+                || !(start_mbps.is_finite() && start_mbps > 0.0)
+            {
+                bail!("--max-mbps must be at least {MIN_MBPS}, and --start-mbps above 0");
             }
             let keys = ticket_key
                 .split(',')
@@ -243,16 +234,16 @@ fn main() -> Result<()> {
                 bail!("no video encoder available");
             }
             let mbps = |m: f64| (m * 1_000_000.0) as u64;
-            let app = Arc::new(session::App {
-                hub: capture::Hub::new(backend),
-                verifier: ticket::Verifier::new(keys, audience.clone()),
-                config: session::Config {
+            let app = Arc::new(session::App::new(
+                capture::Hub::new(backend),
+                ticket::Verifier::new(keys, audience.clone()),
+                session::Config {
                     max_fps,
                     remote_max_fps,
                     max_bitrate: mbps(max_mbps),
                     start_bitrate: mbps(start_mbps.min(max_mbps)),
-                    min_bitrate: mbps(0.5),
-                    encoder: encoder.into(),
+                    min_bitrate: mbps(MIN_MBPS),
+                    encoder,
                     nvenc_preset,
                     vbv_ms,
                     cq: (cq > 0).then_some(cq),
@@ -261,11 +252,8 @@ fn main() -> Result<()> {
                     max_sessions,
                     probe_display: probe_display.or_else(|| std::env::var("DISPLAY").ok()),
                 },
-                sessions: AtomicUsize::new(0),
-                unauthenticated: AtomicUsize::new(0),
-                input_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
                 encoders,
-            });
+            ));
             tracing::info!(audience = %audience, backend = app.hub.backend.name(), "ready");
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -347,7 +335,7 @@ fn main() -> Result<()> {
             bench::run(
                 &backend,
                 seconds,
-                encoder.into(),
+                encoder,
                 codec,
                 (mbps * 1e6) as u64,
                 nvenc_preset,

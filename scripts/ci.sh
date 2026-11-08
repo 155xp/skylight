@@ -1,6 +1,7 @@
 #!/bin/sh
-# What CI runs (see ci/Dockerfile): build, test, and check that nothing ties Skylight to one GPU
-# vendor. Needs no GPU; on a machine without one, the encoder must come up as software.
+# What CI runs (see ci/Dockerfile): format and lint checks, build, the Rust and Node tests, and a
+# check that nothing ties Skylight to one GPU vendor. Needs no GPU; on a machine without one, the
+# encoder must come up as software.
 #
 #   docker build -t skylight-ci ci && docker run --rm -v "$PWD:/src:ro" -e CARGO_TARGET_DIR=/tmp/t skylight-ci scripts/ci.sh
 set -eu
@@ -8,8 +9,13 @@ cd "$(dirname "$0")/.."
 if dpkg -s libffmpeg-nvenc-dev >/dev/null 2>&1; then
   echo "note: nv-codec-headers are installed; this build does not prove it builds without them"
 fi
+cargo fmt --check
+cargo clippy --release --locked --all-targets -- -D warnings
 cargo build --release --locked
 cargo test --release --locked
+node --test clients/node/test/
+node --check web/skylight.js
+node --check web/viewer.js
 bin=${CARGO_TARGET_DIR:-target}/release/skylight
 if ldd "$bin" | grep -iE 'cuda|nvidia|nvenc|nvcuvid'; then
   echo "error: the binary links a GPU vendor library; those must be loaded at runtime" >&2

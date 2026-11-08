@@ -60,11 +60,12 @@ Skylight watches its own picture and repairs it instead of streaming black:
   is reopened when the source closes or fails (KWin closed the screencast, the PipeWire node went
   away), when it delivers no first frame within 3 s, when the picture has been black for 3 s, when
   the pointer moved and the compositor sent nothing back for 2.5 s, or when the monitor changed
-  size or went away. On KWin a reopen alternates between the output stream and a region stream
+  size or went away. A monitor that went away is replaced by the first one left, unless the
+  ticket names it: then the session ends. On KWin a reopen alternates between the output stream and a region stream
   over the same monitor, two separate paths through the compositor. Reopens back off (3 s, 10 s,
   30 s, up to 5 min) so a desktop that really is black costs almost nothing. After three failed
-  reopens in a row the session ends with an error, so the client reconnects or the host page falls
-  back. If the compositor connection itself drops, the server exits and the service restarts it.
+  reopens in a row the session ends with an error and its socket closes, so the client reconnects
+  or the host page falls back. If the compositor connection itself drops, the server exits and the service restarts it.
 - **Encoder.** An encoder that fails twice in a row is skipped for a minute in favour of the next
   one (NVENC, VAAPI, software). The first keyframe from each encoder, then one every 30 s, is
   decoded on the server and compared with the captured picture; an encoder that sends black is

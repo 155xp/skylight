@@ -280,6 +280,18 @@ impl FrameStore {
         subs.push(Arc::downgrade(s));
     }
 
+    /// Undo one `subscribe` (one of several, if `s` subscribed more than once).
+    pub fn unsubscribe(&self, s: &Arc<Signal>) {
+        let mut subs = self.subscribers.lock().unwrap();
+        subs.retain(|w| w.strong_count() > 0);
+        if let Some(i) = subs
+            .iter()
+            .position(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(s)))
+        {
+            subs.swap_remove(i);
+        }
+    }
+
     fn notify(&self, bits: u32) {
         let subs = self.subscribers.lock().unwrap();
         for s in subs.iter().filter_map(|w| w.upgrade()) {
@@ -527,6 +539,22 @@ mod tests {
 
     fn solid(w: u32, h: u32, v: u8) -> Vec<u8> {
         vec![v; (w * h * 4) as usize]
+    }
+
+    #[test]
+    fn a_consumer_that_subscribed_twice_stays_subscribed_after_one_unsubscribe() {
+        // A session switching to the capture it already streams subscribes again before it lets
+        // go of the old subscription.
+        let store = FrameStore::new();
+        let sig = Signal::new();
+        store.subscribe(&sig);
+        store.subscribe(&sig);
+        store.unsubscribe(&sig);
+        store.update(8, 8, PixelFormat::Bgrx, &solid(8, 8, 1), 32, None, 1, 0);
+        assert_eq!(sig.wait(Duration::ZERO) & WAKE_FRAME, WAKE_FRAME);
+        store.unsubscribe(&sig);
+        store.update(8, 8, PixelFormat::Bgrx, &solid(8, 8, 2), 32, None, 2, 0);
+        assert_eq!(sig.wait(Duration::ZERO) & WAKE_FRAME, 0);
     }
 
     #[test]

@@ -429,9 +429,6 @@ impl InputSink for KdeInput {
     fn pointer_abs(&self, x: f64, y: f64) {
         self.fi.pointer_motion_absolute(x, y);
     }
-    fn pointer_rel(&self, dx: f64, dy: f64) {
-        self.fi.pointer_motion(dx, dy);
-    }
     fn button(&self, button: u32, down: bool) {
         self.fi.button(button, down as u32);
     }
@@ -481,7 +478,6 @@ const TEXT_MIMES: [&str; 5] = [
     "TEXT",
     "STRING",
 ];
-const CLIP_MAX: usize = 1 << 20;
 
 impl Clipboard for KdeClipboard {
     fn set_text(&self, text: String) {
@@ -721,7 +717,7 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Stat
             let mut f = std::fs::File::from(r);
             let mut buf = Vec::new();
             let _ = Read::by_ref(&mut f)
-                .take(CLIP_MAX as u64)
+                .take(super::CLIPBOARD_MAX as u64)
                 .read_to_end(&mut buf);
             if let Ok(text) = String::from_utf8(buf) {
                 let c = clip.lock().unwrap();

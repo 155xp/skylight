@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
 use crate::agent;
+use crate::capture::CLIPBOARD_MAX;
 use crate::session::{self, App};
 
 struct Web {
@@ -110,7 +111,8 @@ async fn ws(
     }
     let app = web.app.clone();
     upgrade
-        .max_message_size(1 << 21)
+        // A clipboard message: its text, escaped as JSON.
+        .max_message_size(2 * CLIPBOARD_MAX + 4096)
         .write_buffer_size(0)
         .on_upgrade(move |socket| session::run(socket, app))
 }
@@ -164,6 +166,16 @@ pub async fn serve(app: Arc<App>, listen: SocketAddr, dir: Option<PathBuf>) -> R
             "refusing to listen on {listen}: skylight only binds to loopback and expects an authenticating proxy in front"
         );
     }
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    tracing::info!("listening on http://{listen}");
+    serve_on(listener, app, dir).await
+}
+
+pub async fn serve_on(
+    listener: tokio::net::TcpListener,
+    app: Arc<App>,
+    dir: Option<PathBuf>,
+) -> Result<()> {
     let web = Arc::new(Web { app, dir });
     let router = Router::new()
         .route("/", get(asset))
@@ -176,10 +188,9 @@ pub async fn serve(app: Arc<App>, listen: SocketAddr, dir: Option<PathBuf>) -> R
         .with_state(web);
     use axum::serve::ListenerExt;
     // Small writes (input, acks, the tail of a frame) must never wait for Nagle.
-    let listener = tokio::net::TcpListener::bind(listen).await?.tap_io(|tcp| {
+    let listener = listener.tap_io(|tcp| {
         let _ = tcp.set_nodelay(true);
     });
-    tracing::info!("listening on http://{listen}");
     axum::serve(listener, router).await?;
     Ok(())
 }

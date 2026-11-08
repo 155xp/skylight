@@ -269,6 +269,29 @@ async fn clipboard_text_over_the_limit_is_refused_and_the_session_goes_on() {
     assert!(s.backend.input.events().is_empty());
 }
 
+/// Read frames for `d`, acknowledging each as a viewer does; the first `error`, if one comes.
+async fn watch_for_error(ws: &mut Ws, d: Duration) -> Option<Value> {
+    let until = std::time::Instant::now() + d;
+    while std::time::Instant::now() < until {
+        match next(ws, |m| Some(m.clone())).await? {
+            Message::Binary(b) if b[0] == MSG_VIDEO => {
+                let mut ack = vec![IN_ACK, 0, 0, 0];
+                ack.extend_from_slice(&b[4..8]);
+                ack.extend_from_slice(&0u32.to_le_bytes());
+                ws.send(Message::binary(ack)).await.ok()?;
+            }
+            Message::Text(t) => {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["t"] == "error" {
+                    return Some(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[tokio::test]
 async fn a_session_pinned_to_a_monitor_that_goes_away_ends() {
     let s = server(4).await;
@@ -276,11 +299,10 @@ async fn a_session_pinned_to_a_monitor_that_goes_away_ends() {
     assert_eq!(welcome["monitor"], "B");
     next_json(&mut ws, is("stream")).await.unwrap();
     s.backend.unplug("B");
-    // It never shows monitor A instead: it says why, and closes.
-    let e = next_json(&mut ws, |v| v["t"] == "error" || v["t"] == "stream")
-        .await
-        .unwrap();
-    assert_eq!(e["t"], "error", "{e}");
+    // Even while the viewer acknowledges what the old capture still sends, it never shows
+    // monitor A instead: it says why, and closes.
+    let e = watch_for_error(&mut ws, Duration::from_secs(5)).await;
+    assert!(e.is_some_and(|e| e["message"].as_str().unwrap().contains("went away")));
     assert!(closes(&mut ws).await);
 }
 
@@ -319,22 +341,7 @@ async fn a_pinned_monitor_missing_now_and_then_does_not_end_the_session() {
         s.backend.unplug("B");
         tokio::time::sleep(Duration::from_millis(300)).await;
         s.backend.plug(crate::capture::fake::monitor("B", 320));
-        // Read and acknowledge frames for a while, as a viewer does.
-        let until = std::time::Instant::now() + Duration::from_millis(700);
-        while std::time::Instant::now() < until {
-            let m = next(&mut ws, |m| Some(m.clone()))
-                .await
-                .expect("still open");
-            match m {
-                Message::Binary(b) if b[0] == MSG_VIDEO => {
-                    let mut ack = vec![IN_ACK, 0, 0, 0];
-                    ack.extend_from_slice(&b[4..8]);
-                    ack.extend_from_slice(&0u32.to_le_bytes());
-                    ws.send(Message::binary(ack)).await.unwrap();
-                }
-                Message::Text(t) => assert!(!t.contains(r#""t":"error""#), "{t}"),
-                _ => {}
-            }
-        }
+        let e = watch_for_error(&mut ws, Duration::from_millis(700)).await;
+        assert!(e.is_none(), "{e:?}");
     }
 }

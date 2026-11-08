@@ -239,6 +239,8 @@ pub fn encoder_loop(
     let mut dog = Watchdog::new();
     let mut next_check = Instant::now();
     let mut reopen_failures = 0u32;
+    // The monitor was in the list at the last check.
+    let mut listed = true;
     // Encoder id -> failures in a row, and when it may be tried first again.
     let mut strikes: HashMap<&'static str, u32> = HashMap::new();
     let mut skip: HashMap<&'static str, Instant> = HashMap::new();
@@ -318,6 +320,9 @@ pub fn encoder_loop(
                 )
             };
             let mon = hub.resolve(Some(&src.cap.monitor.id)).ok();
+            listed = mon.is_some();
+            // (A monitor that went away skips the watchdog's backoff on purpose: a pinned
+            // session should end within a second, an unpinned one move at once.)
             let reason = match &mon {
                 None => Some("the display went away"),
                 Some(m) if reason.is_none() && *m != src.cap.monitor => Some("the display changed"),
@@ -698,9 +703,13 @@ pub fn encoder_loop(
         }
         if source_luma >= health::BLACK_LUMA {
             dog.healthy();
-            // A real picture: earlier failed reopens (a monitor missing from one look at the
-            // list, say) were not the start of a run.
-            reopen_failures = 0;
+            // A real picture from a monitor that is there: earlier failed reopens (it was missing
+            // from one look at the list, say) were not the start of a run. While it is missing,
+            // the old capture's pictures prove nothing (on X11 its rectangle may now show another
+            // monitor).
+            if listed {
+                reopen_failures = 0;
+            }
         }
 
         // Now and then, decode a keyframe and make sure the encoder's picture is not black when
